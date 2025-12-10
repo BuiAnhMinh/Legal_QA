@@ -1,0 +1,17 @@
+# Environment files
+.env
+.env.local
+
+# Python caches (if used later)
+__pycache__/
+*.pyc
+
+# Data artifacts
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# IDE
+.DS_Store
+.vscode/

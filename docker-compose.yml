@@ -1,0 +1,54 @@
+
+services:
+  app:
+    platform: linux/amd64 
+    build: .
+    container_name: legal_qa_app
+    restart: "no"
+    env_file:
+      - .env
+    depends_on:
+      - db
+    volumes:
+      # Mount data so you can update json/npy files without rebuilding the image
+      - ./data:/app/data
+    ports:
+      - "7000:7000"   # host:container
+    networks:
+      - legal_net
+
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: legal_qa_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-legal_qa}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+      POSTGRES_DB: ${DB_NAME:-legal_qa}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5400:5400"
+    networks:
+      - legal_net
+
+  # Optional: pgAdmin UI to inspect DB
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: legal_qa_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5040:80"
+    depends_on:
+      - db
+    networks:
+      - legal_net
+
+networks:
+  legal_net:
+
+volumes:
+  db_data:

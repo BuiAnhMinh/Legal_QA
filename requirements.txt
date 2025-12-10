@@ -1,0 +1,9 @@
+numpy
+tqdm
+underthesea
+rank-bm25
+openai
+python-dotenv
+scikit-learn
+psycopg2-binary
+pgvector

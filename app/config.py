@@ -25,8 +25,7 @@ TRAIN_PATH = Path(os.getenv("TRAIN_PATH", DATA_DIR / "train.json"))
 # TRAIN_Q_EMB_PATH = Path(os.getenv("TRAIN_Q_EMB_PATH", DATA_DIR / "train_question_embeddings.npy"))
 # TEST_Q_EMB_PATH = Path(os.getenv("TEST_Q_EMB_PATH", DATA_DIR / "test_question_embeddings.npy"))
 
-# ARTICLE_TOKENS_PATH = Path(os.getenv("ARTICLE_TOKENS_PATH", DATA_DIR / "article_tokens.json"))
-# STOPWORDS_PATH = Path(os.getenv("STOPWORDS_PATH", DATA_DIR / "vietnamese-stopwords.txt"))
+STOPWORDS_PATH = Path(os.getenv("STOPWORDS_PATH", DATA_DIR / "vietnamese-stopwords.txt"))
 
 # ========== Embedding settings ==========
 MAX_CHARS = int(os.getenv("MAX_CHARS", "4000"))
@@ -35,7 +34,7 @@ SAVE_EVERY = int(os.getenv("SAVE_EVERY", "50"))
 
 # ========== DB config (Postgres / pgvector) ==========
 DB_HOST = os.getenv("DB_HOST", "db")
-DB_PORT = int(os.getenv("DB_PORT", "5400"))
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_USER = os.getenv("DB_USER", "legal_qa")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
 DB_NAME = os.getenv("DB_NAME", "legal_qa")

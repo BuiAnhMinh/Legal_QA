@@ -2,8 +2,17 @@ from typing import Dict, List, Set
 
 from underthesea import word_tokenize
 from pathlib import Path
-from app.config import get_connection
+from app.config import STOPWORDS_PATH, get_connection
 from app.data_loader import load_law_documents
+
+# Basic Vietnamese stopword fallback (used if STOPWORDS_PATH is missing)
+DEFAULT_STOPWORDS: Set[str] = {
+    "và", "là", "của", "có", "cho", "một", "các", "những", "được", "trong",
+    "khi", "đã", "sẽ", "tại", "theo", "từ", "đến", "để", "bị", "bằng", "với",
+    "này", "đó", "nên", "thì", "rằng", "vì", "như", "cũng", "chỉ", "rất", "ra",
+    "vào", "lên", "xuống", "qua", "đi", "lại", "hơn", "trên", "dưới", "giữa",
+    "khoảng", "cùng", "nhau", "người", "điều", "khoản", "không", "hoặc", "vẫn",
+}
 
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -23,7 +32,8 @@ CREATE TABLE IF NOT EXISTS articles (
     article_id  TEXT NOT NULL,
     text        TEXT NOT NULL,
     embedding   vector(1536),
-    tokens      TEXT[],
+    token       TEXT[],
+    token_no_stopword TEXT[],
     source      TEXT NOT NULL DEFAULT 'unknown', 
     created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
     is_amending_article BOOLEAN NOT NULL DEFAULT FALSE,
@@ -37,7 +47,30 @@ CREATE INDEX IF NOT EXISTS idx_articles_law_id_article_id
     ON articles(law_id, article_id);
 """
 
+
+def _load_stopwords(path: Path) -> Set[str]:
+    if path.exists():
+        with path.open("r", encoding="utf-8") as f:
+            stops = {line.strip().lower() for line in f if line.strip()}
+        print(f"Loaded {len(stops)} stopwords from {path}")
+        return stops
+
+    print(f"Stopwords file not found at {path}, using default set ({len(DEFAULT_STOPWORDS)})")
+    return DEFAULT_STOPWORDS
+
+
+def _tokenize_text(text: str, stopwords: Set[str]) -> tuple[List[str], List[str]]:
+    if not isinstance(text, str):
+        text = str(text)
+    tok_str = word_tokenize(text, format="text")
+    tokens = [t for t in tok_str.split() if t]
+    tokens_no_stop = [t for t in tokens if t.lower() not in stopwords]
+    return tokens, tokens_no_stop
+
+
 def main():
+    stopwords = _load_stopwords(STOPWORDS_PATH)
+
     docs = load_law_documents()
     total_docs = len(docs)
     print(f"Loaded {total_docs} docs from loader.")
@@ -47,6 +80,9 @@ def main():
 
     try:
         cur.execute(SCHEMA_SQL)
+        # Ensure new columns exist even if table was created previously
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token TEXT[];")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token_no_stopword TEXT[];")
         conn.commit()
         print("Schema ensured (laws, articles).")
 
@@ -57,9 +93,9 @@ def main():
             if law_id in seen:
                 continue
             seen.add(law_id)
-            
+
             source = d.get("source", "unknown")
-            
+
             cur.execute(
                 """
                 INSERT INTO laws (law_id, source)
@@ -93,21 +129,22 @@ def main():
 
             law_pk = law_id_to_pk[law_id]
             text = d["text"] or ""
-            tokens = _tokenize_text(text)
+            tokens, tokens_no_stop = _tokenize_text(text, stopwords)
 
             source = d.get("source", "unknown")
-            
+
             cur.execute(
                 """
-                INSERT INTO articles (law_fk, law_id, article_id, text, tokens, source)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO articles (law_fk, law_id, article_id, text, token, token_no_stopword, source)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (law_id, article_id) DO UPDATE
                 SET law_fk = EXCLUDED.law_fk,
                     text = EXCLUDED.text,
-                    tokens = EXCLUDED.tokens,
+                    token = EXCLUDED.token,
+                    token_no_stopword = EXCLUDED.token_no_stopword,
                     source = EXCLUDED.source;
                 """,
-                (law_pk, law_id, d["article_id"], text, tokens, source),
+                (law_pk, law_id, d["article_id"], text, tokens, tokens_no_stop, source),
             )
             inserted_articles += 1
 

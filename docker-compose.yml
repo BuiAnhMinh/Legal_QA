@@ -28,7 +28,7 @@ services:
     volumes:
       - db_data:/var/lib/postgresql/data
     ports:
-      - "5400:5400"
+      - "5400:5432"
     networks:
       - legal_net
 

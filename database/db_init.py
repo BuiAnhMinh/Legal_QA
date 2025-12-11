@@ -5,15 +5,6 @@ from pathlib import Path
 from app.config import STOPWORDS_PATH, get_connection
 from app.data_loader import load_law_documents
 
-# Basic Vietnamese stopword fallback (used if STOPWORDS_PATH is missing)
-DEFAULT_STOPWORDS: Set[str] = {
-    "và", "là", "của", "có", "cho", "một", "các", "những", "được", "trong",
-    "khi", "đã", "sẽ", "tại", "theo", "từ", "đến", "để", "bị", "bằng", "với",
-    "này", "đó", "nên", "thì", "rằng", "vì", "như", "cũng", "chỉ", "rất", "ra",
-    "vào", "lên", "xuống", "qua", "đi", "lại", "hơn", "trên", "dưới", "giữa",
-    "khoảng", "cùng", "nhau", "người", "điều", "khoản", "không", "hoặc", "vẫn",
-}
-
 SCHEMA_SQL = """
 CREATE EXTENSION IF NOT EXISTS vector;
 
@@ -34,10 +25,44 @@ CREATE TABLE IF NOT EXISTS articles (
     embedding   vector(1536),
     token       TEXT[],
     token_no_stopword TEXT[],
-    source      TEXT NOT NULL DEFAULT 'unknown', 
+    source      TEXT NOT NULL DEFAULT 'unknown',
     created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
     is_amending_article BOOLEAN NOT NULL DEFAULT FALSE,
     CONSTRAINT uq_law_article UNIQUE (law_id, article_id)
+);
+
+-- Drop BM25 helper tables if they exist so we always start clean
+DROP TABLE IF EXISTS article_stats CASCADE;
+DROP TABLE IF EXISTS article_term_freq CASCADE;
+DROP TABLE IF EXISTS term_stats CASCADE;
+DROP TABLE IF EXISTS collection_stats CASCADE;
+
+-- 1) Per-document stats (length etc.) – keyed by doc_id
+CREATE TABLE article_stats (
+    article_id   INT PRIMARY KEY,
+    doc_len      INT NOT NULL
+);
+
+-- 2) Per (doc, term) stats: tf – keyed by doc_id + token
+CREATE TABLE article_term_freq (
+    article_id   INT NOT NULL,
+    token        TEXT NOT NULL,
+    tf           INT NOT NULL,
+    PRIMARY KEY (article_id, token)
+);
+
+-- 3) Global term stats: df + idf
+CREATE TABLE term_stats (
+    token        TEXT PRIMARY KEY,
+    df           INT NOT NULL,
+    idf          DOUBLE PRECISION NOT NULL
+);
+
+-- 4) Collection-level stats: n_docs, avgdl
+CREATE TABLE collection_stats (
+    id           INT PRIMARY KEY CHECK (id = 1),
+    n_docs       INT NOT NULL,
+    avg_doc_len  DOUBLE PRECISION NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_articles_law_fk
@@ -45,18 +70,24 @@ CREATE INDEX IF NOT EXISTS idx_articles_law_fk
 
 CREATE INDEX IF NOT EXISTS idx_articles_law_id_article_id
     ON articles(law_id, article_id);
+
+-- Helpful index to quickly find postings by token
+CREATE INDEX IF NOT EXISTS idx_article_term_token
+    ON article_term_freq (token, article_id);
+
+-- Global doc id from original corpus (VLSP / legal_corpus.json)
+ALTER TABLE articles
+ADD COLUMN IF NOT EXISTS doc_id INT UNIQUE;
 """
 
 
-def _load_stopwords(path: Path) -> Set[str]:
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            stops = {line.strip().lower() for line in f if line.strip()}
-        print(f"Loaded {len(stops)} stopwords from {path}")
-        return stops
-
-    print(f"Stopwords file not found at {path}, using default set ({len(DEFAULT_STOPWORDS)})")
-    return DEFAULT_STOPWORDS
+def load_stopwords(path: Path) -> Set[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Stopwords file not found at {path}")
+    with path.open("r", encoding="utf-8") as f:
+        stops = {line.strip().lower() for line in f if line.strip()}
+    print(f"Loaded {len(stops)} stopwords from {path}")
+    return stops
 
 
 def _tokenize_text(text: str, stopwords: Set[str]) -> tuple[List[str], List[str]]:
@@ -69,7 +100,7 @@ def _tokenize_text(text: str, stopwords: Set[str]) -> tuple[List[str], List[str]
 
 
 def main():
-    stopwords = _load_stopwords(STOPWORDS_PATH)
+    stopwords = load_stopwords(STOPWORDS_PATH)
 
     docs = load_law_documents()
     total_docs = len(docs)
@@ -79,12 +110,13 @@ def main():
     cur = conn.cursor()
 
     try:
+        # Create schema and helper columns
         cur.execute(SCHEMA_SQL)
-        # Ensure new columns exist even if table was created previously
+        # Ensure token columns exist even if table was created in an older version
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token TEXT[];")
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token_no_stopword TEXT[];")
         conn.commit()
-        print("Schema ensured (laws, articles).")
+        print("Schema ensured (laws, articles, BM25 tables).")
 
         # Insert distinct laws
         seen = set()
@@ -118,7 +150,7 @@ def main():
         if missing_laws:
             print("WARNING: some law_id not in laws table, examples:", list(missing_laws)[:5])
 
-        # Insert articles with tokens
+        # Insert articles with tokens + doc_id
         inserted_articles = 0
         print(f"Start inserting {total_docs} articles...")
         for d in docs:
@@ -128,23 +160,32 @@ def main():
                 continue
 
             law_pk = law_id_to_pk[law_id]
-            text = d["text"] or ""
+            text = d.get("text") or ""
             tokens, tokens_no_stop = _tokenize_text(text, stopwords)
 
             source = d.get("source", "unknown")
 
+            # Try to get global doc_id from corpus; fallback to d["id"] if present
+            raw_doc_id = d.get("doc_id")
+            if raw_doc_id is None and "id" in d:
+                raw_doc_id = d["id"]
+            doc_id = raw_doc_id  # can be None; those rows will be excluded from BM25 stats
+
             cur.execute(
                 """
-                INSERT INTO articles (law_fk, law_id, article_id, text, token, token_no_stopword, source)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO articles (
+                    law_fk, law_id, article_id, doc_id, text, token, token_no_stopword, source
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (law_id, article_id) DO UPDATE
-                SET law_fk = EXCLUDED.law_fk,
-                    text = EXCLUDED.text,
-                    token = EXCLUDED.token,
+                SET law_fk            = EXCLUDED.law_fk,
+                    text              = EXCLUDED.text,
+                    token             = EXCLUDED.token,
                     token_no_stopword = EXCLUDED.token_no_stopword,
-                    source = EXCLUDED.source;
+                    source            = EXCLUDED.source,
+                    doc_id            = EXCLUDED.doc_id;
                 """,
-                (law_pk, law_id, d["article_id"], text, tokens, tokens_no_stop, source),
+                (law_pk, law_id, d["article_id"], doc_id, text, tokens, tokens_no_stop, source),
             )
             inserted_articles += 1
 
@@ -154,6 +195,85 @@ def main():
 
         conn.commit()
         print(f"Finished inserting ~{inserted_articles} articles (out of {total_docs}).")
+
+        # Quick sanity check on doc_id coverage
+        cur.execute("SELECT COUNT(*) FROM articles WHERE doc_id IS NOT NULL;")
+        non_null_docid = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM articles WHERE doc_id IS NULL;")
+        null_docid = cur.fetchone()[0]
+        print(f"Articles with non-null doc_id: {non_null_docid}")
+        print(f"Articles with NULL doc_id (excluded from BM25 index): {null_docid}")
+
+        print("Recomputing BM25 stats (article_stats, article_term_freq, term_stats, collection_stats)...")
+
+        # 1) Per-document length (only docs with a valid global doc_id)
+        cur.execute(
+            """
+            INSERT INTO article_stats (article_id, doc_len)
+            SELECT
+                a.doc_id,
+                cardinality(COALESCE(a.token, ARRAY[]::text[])) AS doc_len
+            FROM articles a
+            WHERE a.doc_id IS NOT NULL;
+            """
+        )
+
+        # 2) Per (doc, token) term frequency (same doc_id filter)
+        cur.execute(
+            """
+            INSERT INTO article_term_freq (article_id, token, tf)
+            SELECT
+                a.doc_id,
+                tok,
+                COUNT(*) AS tf
+            FROM articles a
+            CROSS JOIN LATERAL unnest(COALESCE(a.token, ARRAY[]::text[])) AS tok
+            WHERE a.doc_id IS NOT NULL
+            GROUP BY a.doc_id, tok;
+            """
+        )
+
+        # 3) Collection stats (robust even if article_stats is empty)
+        cur.execute(
+            """
+            INSERT INTO collection_stats (id, n_docs, avg_doc_len)
+            SELECT
+                1,
+                COUNT(*) AS n_docs,
+                COALESCE(AVG(doc_len)::float, 0) AS avg_doc_len
+            FROM article_stats
+            ON CONFLICT (id) DO UPDATE
+            SET n_docs      = EXCLUDED.n_docs,
+                avg_doc_len = EXCLUDED.avg_doc_len;
+            """
+        )
+
+        # 4) Term stats (df + idf)
+        cur.execute(
+            """
+            INSERT INTO term_stats (token, df, idf)
+            SELECT
+                t.token,
+                t.df,
+                ln((c.n_docs - t.df + 0.5) / (t.df + 0.5) + 1) AS idf
+            FROM (
+                SELECT token, COUNT(*) AS df
+                FROM (
+                    SELECT DISTINCT article_id, token
+                    FROM article_term_freq
+                ) d
+                GROUP BY token
+            ) t
+            CROSS JOIN collection_stats c
+            WHERE c.id = 1
+            ON CONFLICT (token) DO UPDATE
+            SET df  = EXCLUDED.df,
+                idf = EXCLUDED.idf;
+            """
+        )
+
+        conn.commit()
+        print("BM25 stats recomputed.")
 
     except Exception as e:
         conn.rollback()

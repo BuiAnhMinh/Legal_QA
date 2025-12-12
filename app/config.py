@@ -8,7 +8,7 @@ from openai import OpenAI
 load_dotenv()
 
 # ========== OpenAI / OpenRouter ==========
-OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY") 
+OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 
 EMB_MODEL = os.getenv("EMB_MODEL", "openai/text-embedding-3-small")
@@ -17,20 +17,23 @@ LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4.1-mini")
 # ========== Paths ==========
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
-# Law corpora (adjust these in .env to match your real files)
 LAW_PATH = Path(os.getenv("LAW_PATH", DATA_DIR / "legal_corpus.json"))
 TRAIN_PATH = Path(os.getenv("TRAIN_PATH", DATA_DIR / "train.json"))
-
-# ARTICLE_EMB_PATH = Path(os.getenv("ARTICLE_EMB_PATH", DATA_DIR / "article_embeddings.npy"))
-# TRAIN_Q_EMB_PATH = Path(os.getenv("TRAIN_Q_EMB_PATH", DATA_DIR / "train_question_embeddings.npy"))
-# TEST_Q_EMB_PATH = Path(os.getenv("TEST_Q_EMB_PATH", DATA_DIR / "test_question_embeddings.npy"))
 
 STOPWORDS_PATH = Path(os.getenv("STOPWORDS_PATH", DATA_DIR / "vietnamese-stopwords.txt"))
 
 # ========== Embedding settings ==========
-MAX_CHARS = int(os.getenv("MAX_CHARS", "4000"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "64"))
-SAVE_EVERY = int(os.getenv("SAVE_EVERY", "50"))
+MAX_CHARS = int(os.getenv("MAX_CHARS", "4000"))          # max chars per chunk sent to embeddings API
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))          # texts per API request
+SAVE_EVERY = int(os.getenv("SAVE_EVERY", "50"))          # commit every N batches/ops (used by various scripts)
+
+# Concurrency for embedding script (multiple API calls at once)
+EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", "16"))
+
+# Chunking settings
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", str(MAX_CHARS)))
+CHUNK_OVERLAP_CHARS = int(os.getenv("CHUNK_OVERLAP_CHARS", "200"))
+CHUNK_MIN_CHARS = int(os.getenv("CHUNK_MIN_CHARS", "200"))  # prevent tiny chunks when possible
 
 # ========== DB config (Postgres / pgvector) ==========
 DB_HOST = os.getenv("DB_HOST", "db")

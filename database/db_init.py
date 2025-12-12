@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS articles (
     article_id  TEXT NOT NULL,
     text        TEXT NOT NULL,
     embedding   vector(1536),
+    embedding_bge_m3 vector(1024),
     token       TEXT[],
     token_no_stopword TEXT[],
     source      TEXT NOT NULL DEFAULT 'unknown',
@@ -30,6 +31,28 @@ CREATE TABLE IF NOT EXISTS articles (
     is_amending_article BOOLEAN NOT NULL DEFAULT FALSE,
     CONSTRAINT uq_law_article UNIQUE (law_id, article_id)
 );
+
+-- Chunks: every article has 1..N chunks
+CREATE TABLE IF NOT EXISTS article_chunks (
+    id                  BIGSERIAL PRIMARY KEY,
+    article_fk          INT NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
+    doc_id              INT,
+    chunk_index         INT NOT NULL,
+    char_start          INT NOT NULL,
+    char_end            INT NOT NULL,
+    text                TEXT NOT NULL,
+    token               TEXT[],
+    token_no_stopword   TEXT[],
+    embedding_bge_m3    vector(1024),
+    created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_article_chunk UNIQUE (article_fk, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_article_chunks_article_fk
+    ON article_chunks(article_fk);
+
+CREATE INDEX IF NOT EXISTS idx_article_chunks_doc_id
+    ON article_chunks(doc_id);
 
 -- Drop BM25 helper tables if they exist so we always start clean
 DROP TABLE IF EXISTS article_stats CASCADE;
@@ -116,6 +139,9 @@ def main():
         # Ensure token columns exist even if table was created in an older version
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token TEXT[];")
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token_no_stopword TEXT[];")
+        # Ensure embedding columns exist (legacy tables may be missing bge_m3)
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding vector(1536);")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_bge_m3 vector(1024);")
         conn.commit()
         print("Schema ensured (laws, articles, BM25 tables).")
 

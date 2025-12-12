@@ -12,6 +12,8 @@ services:
     volumes:
       # Mount data so you can update json/npy files without rebuilding the image
       - ./data:/app/data
+      - ./app:/app/app
+      - ./database:/app/database
     ports:
       - "8080:8080"   # host:container
     networks:

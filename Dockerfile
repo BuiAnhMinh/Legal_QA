@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY data ./data
 COPY database ./database
+COPY debug ./debug
 # 7) Expose a port (if you're running an API, e.g. FastAPI)
 EXPOSE 8000
 

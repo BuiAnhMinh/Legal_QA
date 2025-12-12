@@ -2,36 +2,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Set
 
 import asyncpg
 import numpy as np
 from underthesea import word_tokenize
 
-from app.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, STOPWORDS_PATH
+from app.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER
 from app.data_loader import load_train_data
 
 
-def load_stopwords(path: Path) -> Set[str]:
-    if not path.exists():
-        raise FileNotFoundError(f"Stopwords file not found at {path}")
-    with path.open("r", encoding="utf-8") as f:
-        stops = {line.strip().lower() for line in f if line.strip()}
-    print(f"Loaded {len(stops)} stopwords from {path}")
-    return stops
-
-
-def tokenize_question(text: str, stopwords: Set[str] | None = None) -> List[str]:
+def tokenize_question(text: str) -> List[str]:
     """
     Tokenize a question using underthesea.
-    If stopwords is None -> keep ALL tokens (including 'stopwords').
+    Keep ALL tokens (including stopwords) to align with precomputed article tokens.
     """
     tok_str = word_tokenize(text or "", format="text")
-    tokens = [t for t in tok_str.split() if t]
-    if stopwords is None:
-        return tokens
-    return [t for t in tokens if t.lower() not in stopwords]
+    tokens = [t.lower() for t in tok_str.split() if t]
+    return tokens
 
 
 def fbeta_score(gold: Set[int], pred: Sequence[int], beta: float = 2.0) -> float:
@@ -85,8 +73,8 @@ async def bm25_query(
     WITH params AS (
         SELECT
             $1::text[] AS tokens,
-            1.2::float  AS k1,
-            0.75::float AS b
+            2.0::float  AS k1,
+            1.0::float AS b
     ),
     scored AS (
         SELECT
@@ -134,7 +122,7 @@ async def evaluate_variant(
     async def worker(q: Dict) -> float:
         async with sem:
             # IMPORTANT: keep stopwords -> match `articles.token`
-            q_tokens = tokenize_question(q["text"], stopwords=None)
+            q_tokens = tokenize_question(q["text"])
             preds = await bm25_query(
                 pool=pool,
                 query_terms=q_tokens,

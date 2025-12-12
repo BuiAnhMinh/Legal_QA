@@ -94,8 +94,9 @@ def _tokenize_text(text: str, stopwords: Set[str]) -> tuple[List[str], List[str]
     if not isinstance(text, str):
         text = str(text)
     tok_str = word_tokenize(text, format="text")
-    tokens = [t for t in tok_str.split() if t]
-    tokens_no_stop = [t for t in tokens if t.lower() not in stopwords]
+    # Lowercase to make indexing/querying case-insensitive; keep stopwords in `tokens`.
+    tokens = [t.lower() for t in tok_str.split() if t]
+    tokens_no_stop = [t for t in tokens if t not in stopwords]
     return tokens, tokens_no_stop
 
 

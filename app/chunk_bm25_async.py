@@ -56,15 +56,19 @@ def _dedup(tokens: Sequence[str]) -> List[str]:
 
 
 async def fetch_chunk_collection_stats(pool: asyncpg.pool.Pool) -> Tuple[float, float]:
+    """
+    Read precomputed collection stats from chunk_collection_stats (built by database/db_chunk_bm25_stats.py).
+    """
     sql = """
-    SELECT
-        COUNT(*)::float AS n_docs,
-        COALESCE(AVG(cardinality(token)), 0)::float AS avg_doc_len
-    FROM article_chunks
-    WHERE doc_id IS NOT NULL;
+    SELECT n_docs::float AS n_docs, avg_doc_len::float AS avg_doc_len
+    FROM chunk_collection_stats
+    WHERE id = 1;
     """
     async with pool.acquire() as conn:
         row = await conn.fetchrow(sql)
+
+    if not row:
+        raise RuntimeError("chunk_collection_stats is empty. Run database/db_chunk_bm25_stats.py first.")
 
     n_docs = float(row["n_docs"] or 0.0)
     avg_doc_len = float(row["avg_doc_len"] or 0.0)
@@ -75,71 +79,60 @@ async def chunk_bm25_query(
     pool: asyncpg.pool.Pool,
     query_terms: Sequence[str],
     top_k: int,
-    collection_stats: Tuple[float, float],
 ) -> List[int]:
+    """
+    BM25 over chunks using precomputed DB-side stats:
+      - chunk_term_freq(chunk_id, token, tf)
+      - chunk_stats(chunk_id, doc_id, doc_len)
+      - chunk_term_stats(token, df, idf)
+      - chunk_collection_stats(id=1, n_docs, avg_doc_len)
+    Aggregates chunk scores to doc_id via MAX(chunk_score).
+    """
     tokens = _dedup([t for t in query_terms if t])
-    n_docs, avg_doc_len = collection_stats
-    if not tokens or n_docs <= 0 or avg_doc_len <= 0:
+    if not tokens:
         return []
 
     sql = """
     WITH params AS (
         SELECT
             $1::text[] AS tokens,
-            $2::float AS n_docs,
-            $3::float AS avg_doc_len,
             1.2::float AS k1,
             0.75::float AS b
     ),
-    q_tokens AS (
-        SELECT DISTINCT token
-        FROM params, unnest(tokens) AS token
-    ),
-    tf AS (
+    scored AS (
         SELECT
-            ac.id AS chunk_id,
-            ac.doc_id AS doc_id,
-            qt.token AS token,
-            COUNT(*) AS tf,
-            cardinality(ac.token) AS doc_len
-        FROM article_chunks ac
-        JOIN q_tokens qt ON TRUE
-        JOIN LATERAL unnest(ac.token) AS ct(token) ON ct.token = qt.token
-        WHERE ac.doc_id IS NOT NULL
-        GROUP BY ac.id, ac.doc_id, qt.token, cardinality(ac.token)
-    ),
-    df AS (
-        SELECT token, COUNT(DISTINCT chunk_id)::float AS df
-        FROM tf
-        GROUP BY token
-    ),
-    chunk_scores AS (
-        SELECT
-            tf.chunk_id,
-            tf.doc_id,
+            ctf.chunk_id,
+            cs.doc_id,
             SUM(
-                ln((p.n_docs - d.df + 0.5) / (d.df + 0.5) + 1) *
-                (tf.tf * (p.k1 + 1)) /
-                (tf.tf + p.k1 * (1 - p.b + p.b * tf.doc_len / p.avg_doc_len))
+                cts.idf *
+                (ctf.tf * (p.k1 + 1)) /
+                (ctf.tf + p.k1 * (1 - p.b + p.b * cs.doc_len / ccs.avg_doc_len))
             ) AS score
-        FROM tf
-        JOIN df d ON tf.token = d.token
+        FROM chunk_term_freq ctf
+        JOIN chunk_term_stats cts
+          ON ctf.token = cts.token
+        JOIN chunk_stats cs
+          ON cs.chunk_id = ctf.chunk_id
+        JOIN chunk_collection_stats ccs
+          ON ccs.id = 1
         JOIN params p ON TRUE
-        GROUP BY tf.chunk_id, tf.doc_id
+        WHERE ctf.token = ANY (p.tokens)
+          AND cs.doc_id IS NOT NULL
+        GROUP BY ctf.chunk_id, cs.doc_id
     ),
     doc_scores AS (
         SELECT doc_id, MAX(score) AS score
-        FROM chunk_scores
+        FROM scored
         GROUP BY doc_id
     )
     SELECT doc_id
     FROM doc_scores
     ORDER BY score DESC
-    LIMIT $4;
+    LIMIT $2;
     """
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, tokens, n_docs, avg_doc_len, top_k)
+        rows = await conn.fetch(sql, tokens, top_k)
     return [int(r["doc_id"]) for r in rows]
 
 
@@ -148,18 +141,16 @@ async def evaluate_chunk_bm25(
     questions: Iterable[Dict],
     top_k: int,
     concurrency: int,
-    collection_stats: Tuple[float, float],
 ) -> float:
     sem = asyncio.Semaphore(max(1, concurrency))
 
     async def worker(q: Dict) -> tuple[float, float, float]:
         async with sem:
-            q_tokens = await asyncio.to_thread(tokenize_question, q["text"])
+            q_tokens = tokenize_question(q["text"])
             preds = await chunk_bm25_query(
                 pool=pool,
                 query_terms=q_tokens,
                 top_k=top_k,
-                collection_stats=collection_stats,
             )
             f2 = fbeta_score(q["gold_doc_ids"], preds, beta=2.0)
             prec, rec = precision_recall(q["gold_doc_ids"], preds)
@@ -177,7 +168,7 @@ async def evaluate_chunk_bm25(
     macro_rec = float(np.mean(rec_scores))
 
     print(
-        f"Chunk BM25 (per-chunk scored, max-doc aggregation) @ {top_k}: "
+        f"Chunk BM25 (precomputed stats) @ {top_k}: "
         f"macro F2={macro_f2:.4f} | macro Precision={macro_prec:.4f} | "
         f"macro Recall={macro_rec:.4f} over {len(results)} questions"
     )
@@ -202,11 +193,10 @@ async def main_async(top_k: int, limit: int | None, concurrency: int):
     )
 
     try:
-        collection_stats = await fetch_chunk_collection_stats(pool)
-        n_docs, avg_doc_len = collection_stats
+        n_docs, avg_doc_len = await fetch_chunk_collection_stats(pool)
         print(f"Chunk collection stats: n_chunks={int(n_docs)}, avg_len={avg_doc_len:.2f}")
         if n_docs <= 0 or avg_doc_len <= 0:
-            print("No chunk stats available; aborting.")
+            print("No chunk BM25 stats available; aborting.")
             return
 
         await evaluate_chunk_bm25(
@@ -214,7 +204,6 @@ async def main_async(top_k: int, limit: int | None, concurrency: int):
             questions=questions,
             top_k=top_k,
             concurrency=concurrency,
-            collection_stats=collection_stats,
         )
     finally:
         await pool.close()
@@ -222,7 +211,7 @@ async def main_async(top_k: int, limit: int | None, concurrency: int):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Chunk-level BM25 retrieval (DB-side) with async/threaded question fan-out."
+        description="Chunk-level BM25 retrieval (DB-side precomputed stats) with async question fan-out."
     )
     parser.add_argument("--top-k", type=int, default=10, help="Top-K documents to evaluate.")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of questions.")

@@ -7,77 +7,13 @@ from typing import Dict, Iterable, List, Sequence
 
 import asyncpg
 import numpy as np
-from pgvector.asyncpg import register_vector
-
 from app.config import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER
 from app.semantic_eval_utils import (
     fbeta_score,
     load_questions_with_embeddings,
     precision_recall,
 )
-
-
-async def _init_pgvector(conn: asyncpg.Connection) -> None:
-    await register_vector(conn)
-
-
-async def ann_query(
-    pool: asyncpg.pool.Pool,
-    query_vec: Sequence[float],
-    top_k: int,
-    probes: int | None = None,
-    metric: str = "cosine",
-) -> List[int]:
-    """
-    ANN via pgvector index on article_chunks.embedding_bge_m3.
-    metric: 'cosine' (<=>) or 'l2' (<->) or 'ip' (<#>)
-    Returns top_k doc_ids by best chunk score (max for ip, min for dist).
-    """
-    if query_vec is None:
-        return []
-    if hasattr(query_vec, "size") and query_vec.size == 0:
-        return []
-    if not hasattr(query_vec, "size") and len(query_vec) == 0:
-        return []
-
-    q_list = query_vec.tolist() if hasattr(query_vec, "tolist") else list(query_vec)
-
-    op = {
-        "cosine": "<=>",
-        "l2": "<->",
-        "ip": "<#>",
-    }.get(metric, "<=>")
-
-    order = "ASC" if metric in ("cosine", "l2") else "DESC"
-
-    sql = f"""
-    WITH top_chunks AS (
-        SELECT
-            ac.doc_id,
-            ac.embedding_bge_m3 {op} $1::vector AS score
-        FROM article_chunks ac
-        WHERE ac.embedding_bge_m3 IS NOT NULL
-          AND ac.doc_id IS NOT NULL
-        ORDER BY ac.embedding_bge_m3 {op} $1::vector {order}
-        LIMIT $2
-    ),
-    doc_scores AS (
-        SELECT doc_id, MIN(score) AS best_score
-        FROM top_chunks
-        GROUP BY doc_id
-    )
-    SELECT doc_id
-    FROM doc_scores
-    ORDER BY best_score {order}
-    LIMIT $3;
-    """
-
-    async with pool.acquire() as conn:
-        if probes is not None:
-            await conn.execute("SET ivfflat.probes = $1;", probes)
-        rows = await conn.fetch(sql, q_list, top_k, top_k)
-
-    return [int(r["doc_id"]) for r in rows]
+from app.retrieval_shared import ann_query, init_pgvector
 
 
 async def evaluate(
@@ -85,7 +21,9 @@ async def evaluate(
     questions: Iterable[Dict],
     top_k: int,
     concurrency: int,
+    chunk_limit: int,
     probes: int | None,
+    ef_search: int | None,
     metric: str,
 ) -> float:
     """
@@ -117,7 +55,9 @@ async def evaluate(
                 pool=pool,
                 query_vec=q["embedding"],
                 top_k=top_k,
+                chunk_limit=chunk_limit,
                 probes=probes,
+                ef_search=ef_search,
                 metric=metric,
             )
             f2s.append(fbeta_score(q["gold_doc_ids"], preds, beta=2.0))
@@ -151,7 +91,9 @@ async def main_async(
     top_k: int,
     limit: int | None,
     concurrency: int,
+    chunk_limit: int,
     probes: int | None,
+    ef_search: int | None,
     metric: str,
     emb_path: Path,
     meta_path: Path,
@@ -159,7 +101,7 @@ async def main_async(
     questions = load_questions_with_embeddings(limit=limit, emb_path=emb_path, meta_path=meta_path)
     print(
         f"Evaluating ANN ({metric}) on {len(questions)} questions "
-        f"(concurrency={concurrency}, probes={probes})."
+        f"(concurrency={concurrency}, chunk_limit={chunk_limit}, probes={probes}, ef_search={ef_search})."
     )
 
     pool = await asyncpg.create_pool(
@@ -170,7 +112,7 @@ async def main_async(
         database=DB_NAME,
         min_size=1,
         max_size=max(1, concurrency),
-        init=_init_pgvector,
+        init=init_pgvector,
     )
 
     try:
@@ -179,7 +121,9 @@ async def main_async(
             questions=questions,
             top_k=top_k,
             concurrency=concurrency,
+            chunk_limit=chunk_limit,
             probes=probes,
+            ef_search=ef_search,
             metric=metric,
         )
     finally:
@@ -199,10 +143,22 @@ def main():
         help="Concurrent DB queries; also limits DB pool size.",
     )
     parser.add_argument(
+        "--chunk-limit",
+        type=int,
+        default=5000,
+        help="Top chunks returned from ANN before doc aggregation (set high for recall).",
+    )
+    parser.add_argument(
         "--probes",
         type=int,
         default=None,
         help="Set ivfflat.probes for recall/speed tradeoff (requires IVF index).",
+    )
+    parser.add_argument(
+        "--ef-search",
+        type=int,
+        default=None,
+        help="Set hnsw.ef_search for recall/speed tradeoff (requires HNSW index).",
     )
     parser.add_argument(
         "--metric",
@@ -233,7 +189,9 @@ def main():
             top_k=args.top_k,
             limit=args.limit,
             concurrency=args.concurrency,
+            chunk_limit=args.chunk_limit,
             probes=args.probes,
+            ef_search=args.ef_search,
             metric=args.metric,
             emb_path=emb_path,
             meta_path=meta_path,

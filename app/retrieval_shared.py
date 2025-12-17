@@ -145,15 +145,23 @@ def hybrid_merge(
     dense_pairs: List[tuple[int, float]],
     alpha: float,
 ) -> List[int]:
+    score_map = hybrid_score_map(bm25_pairs, dense_pairs, alpha)
+    combined = sorted(score_map.items(), key=lambda x: x[1], reverse=True)
+    return [doc for doc, _ in combined]
+
+
+def hybrid_score_map(
+    bm25_pairs: List[tuple[int, float]],
+    dense_pairs: List[tuple[int, float]],
+    alpha: float,
+) -> Dict[int, float]:
     bm25_norm = min_max_norm(bm25_pairs)
     dense_norm = min_max_norm(dense_pairs)
     doc_ids = set(bm25_norm) | set(dense_norm)
 
-    combined: List[tuple[int, float]] = []
+    combined: Dict[int, float] = {}
     for doc in doc_ids:
         b = bm25_norm.get(doc, 0.0)
         d = dense_norm.get(doc, 0.0)
-        combined.append((doc, alpha * b + (1 - alpha) * d))
-
-    combined.sort(key=lambda x: x[1], reverse=True)
-    return [doc for doc, _ in combined]
+        combined[doc] = alpha * b + (1 - alpha) * d
+    return combined

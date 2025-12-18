@@ -12,7 +12,7 @@ OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 
 EMB_MODEL = os.getenv("EMB_MODEL", "openai/text-embedding-3-small")
-LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4.1-mini")
+LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
 
 # ========== Paths ==========
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
@@ -43,6 +43,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
 DB_NAME = os.getenv("DB_NAME", "legal_qa")
 
 
+JINA_API_KEY = os.getenv("JINA_API_KEY")
 def get_connection():
     """Return a psycopg2 connection to the Postgres DB."""
     return psycopg2.connect(

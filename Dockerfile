@@ -21,6 +21,7 @@ COPY data ./data
 COPY database ./database
 COPY debug ./debug
 COPY scripts ./scripts
+
 # 7) Expose a port (if you're running an API, e.g. FastAPI)
 EXPOSE 8000
 

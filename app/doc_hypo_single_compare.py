@@ -19,10 +19,40 @@ from app.config import (
     get_client,
 )
 
+ANCHORS = [
+    "người đại diện",
+    "phạm vi đại diện",
+    "giao dịch dân sự",
+    "ủy quyền",
+]
+
+FORBIDDEN = [
+    "kiểm tra viên",
+    "thanh tra",
+    "điện lực",
+    "công an",
+    "kiểm lâm",
+    "quản lý thị trường",
+    "biên bản kiểm tra",
+]
+
+STYLE_HINTS = [
+    "Giải thích đơn giản cho người không chuyên, câu ngắn.",
+    "Diễn đạt theo văn phong pháp lý trung tính, súc tích.",
+    "Nhấn mạnh giới hạn và phạm vi đại diện cùng căn cứ xác định.",
+    "Nhấn mạnh xung đột lợi ích: không giao dịch với chính mình hoặc đại diện đôi.",
+    "Nhấn mạnh nghĩa vụ thông báo phạm vi đại diện cho bên giao dịch.",
+]
+
+MIN_W, MAX_W = 100, 150
+
 PROMPT_TEMPLATE = (
     "You are a Vietnamese legal expert and lawyer.\n\n"
     "Your task is to generate a hypothetical explanatory document that describes\n"
     "the legal rule, legal principle, or legal mechanism expressed in the given law article.\n\n"
+    "ANCHOR REQUIREMENT:\n"
+    '- The output MUST contain all of these phrases (verbatim): "người đại diện", "phạm vi đại diện", "giao dịch dân sự", "ủy quyền".\n'
+    "- Do NOT introduce any new titles/roles not present in the input.\n\n"
     "IMPORTANT CONSTRAINTS:\n"
     "- Do NOT restate, paraphrase, or answer any specific user question.\n"
     "- Do NOT mention specific legal actions, disputes, cases, or factual scenarios\n"
@@ -35,9 +65,12 @@ PROMPT_TEMPLATE = (
     "- Do NOT mention article numbers or citations.\n\n"
     "OUTPUT REQUIREMENTS:\n"
     "- Write one coherent explanatory document.\n"
-    "- Length: 100–150 words.\n"
+    "- Length: 100–150 words. If your output is not between 100 and 150 words, it is invalid and must be regenerated.\n"
     "- Structure: clear sentences, no bullet points.\n"
-    "- Do not include headings or lists.\n\n"
+    "- If you produce any bullet points or numbering, your output is invalid.\n"
+    "- Do not include headings or lists.\n"
+    "- Do not use Markdown (no bold, no lists, no headings).\n\n"
+    "STYLE: {style_hint}\n\n"
     "INPUT LAW ARTICLE:\n"
     "{law_article}"
 )
@@ -47,9 +80,20 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"\w+", text))
 
 
-def _generate_hypo_doc(article_text: str, max_chars: int, temperature: float) -> str:
+def _valid_len(text: str) -> bool:
+    w = _word_count(text)
+    return MIN_W <= w <= MAX_W
+
+
+def _no_markdown(text: str) -> bool:
+    return ("**" not in text) and ("#" not in text) and ("```" not in text)
+
+
+def _generate_hypo_doc(
+    article_text: str, max_chars: int, temperature: float, style_hint: str
+) -> str:
     trimmed = article_text[:max_chars]
-    prompt = PROMPT_TEMPLATE.format(law_article=trimmed)
+    prompt = PROMPT_TEMPLATE.format(law_article=trimmed, style_hint=style_hint)
     client = get_client()
     resp = client.chat.completions.create(
         model=LLM_MODEL,
@@ -58,8 +102,39 @@ def _generate_hypo_doc(article_text: str, max_chars: int, temperature: float) ->
             {"role": "user", "content": prompt},
         ],
         temperature=temperature,
+        presence_penalty=0.6,
+        frequency_penalty=0.4,
     )
     return (resp.choices[0].message.content or "").strip()
+
+
+def _is_good_hypo(text: str) -> bool:
+    t = text.lower()
+    if any(a not in t for a in ANCHORS):
+        return False
+    if any(f in t for f in FORBIDDEN):
+        return False
+    if not _valid_len(text):
+        return False
+    if not _no_markdown(text):
+        return False
+    if re.search(r"^\s*[-•\d]+[.)]?", text, flags=re.MULTILINE):
+        return False
+    return True
+
+
+def _generate_hypo_with_retry(
+    article_text: str, max_chars: int, temperature: float, style_hint: str, tries: int = 6
+) -> str:
+    last = ""
+    for _ in range(max(1, tries)):
+        out = _generate_hypo_doc(
+            article_text, max_chars=max_chars, temperature=temperature, style_hint=style_hint
+        )
+        if _is_good_hypo(out):
+            return out
+        last = out
+    return last
 
 
 def _embed_texts(model: str, texts: List[str]) -> List[List[float]]:
@@ -81,6 +156,15 @@ def _ip(a: np.ndarray, b: np.ndarray) -> float:
 
 def _l2(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a - b))
+
+
+def _sim(a: np.ndarray, b: np.ndarray, metric: str) -> float:
+    if metric == "cosine":
+        return _cosine(a, b)
+    if metric == "ip":
+        return _ip(a, b)
+    # l2: convert to similarity by negating distance
+    return -_l2(a, b)
 
 
 async def _fetch_article_text(pool: asyncpg.pool.Pool, doc_id: int) -> str:
@@ -116,26 +200,39 @@ async def main_async(
     finally:
         await pool.close()
 
-    hypo_docs = [
-        _generate_hypo_doc(article_text, max_chars=max_article_chars, temperature=temperature)
-        for _ in range(num_hypo)
-    ]
+    preview = article_text[:300].replace("\n", " ")
+    print(f"ARTICLE PREVIEW: {preview}")
 
-    embeddings = _embed_texts(emb_model, [question] + hypo_docs)
+    style_seq = STYLE_HINTS[:num_hypo] if num_hypo <= len(STYLE_HINTS) else STYLE_HINTS
+    if num_hypo > len(STYLE_HINTS):
+        extra_needed = num_hypo - len(STYLE_HINTS)
+        style_seq = STYLE_HINTS + STYLE_HINTS[:extra_needed]
+
+    async def gen_one(style_hint: str) -> str:
+        return await asyncio.to_thread(
+            _generate_hypo_with_retry,
+            article_text,
+            max_article_chars,
+            temperature,
+            style_hint,
+            6,
+        )
+
+    hypo_docs = await asyncio.gather(*(gen_one(s) for s in style_seq))
+
+    embeddings = _embed_texts(emb_model, [question, article_text] + hypo_docs)
     q_emb = np.array(embeddings[0], dtype="float32")
-    hypo_embs = [np.array(e, dtype="float32") for e in embeddings[1:]]
+    a_emb = np.array(embeddings[1], dtype="float32")
+    hypo_embs = [np.array(e, dtype="float32") for e in embeddings[2:]]
 
     scored = []
     for idx, (text, emb) in enumerate(zip(hypo_docs, hypo_embs), start=1):
-        if metric == "cosine":
-            score = _cosine(q_emb, emb)
-        elif metric == "ip":
-            score = _ip(q_emb, emb)
-        else:
-            score = _l2(q_emb, emb)
-        scored.append((idx, score, text))
+        s_q = _sim(q_emb, emb, metric)
+        s_a = _sim(a_emb, emb, metric)
+        score = 0.7 * s_q + 0.3 * s_a
+        scored.append((idx, score, s_q, s_a, text))
 
-    reverse = metric != "l2"
+    reverse = True  # similarity; higher better (we negate l2 above)
     scored.sort(key=lambda x: x[1], reverse=reverse)
 
     print(f"Doc_id: {doc_id}")
@@ -143,10 +240,10 @@ async def main_async(
     print(f"Article chars: {len(article_text)} (used {min(len(article_text), max_article_chars)})")
     print(f"Metric: {metric} (higher is better)" if metric != "l2" else "Metric: l2 (lower is better)")
 
-    for idx, score, text in scored:
+    for idx, score, s_q, s_a, text in scored:
         wc = _word_count(text)
         print("-" * 80)
-        print(f"Hypo #{idx} | words={wc} | score={score:.4f}")
+        print(f"Hypo #{idx} | words={wc} | score={score:.4f} | s_q={s_q:.4f} | s_a={s_a:.4f}")
         print(text)
 
 

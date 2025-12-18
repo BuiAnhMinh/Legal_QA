@@ -42,6 +42,10 @@ DB_USER = os.getenv("DB_USER", "legal_qa")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "secret")
 DB_NAME = os.getenv("DB_NAME", "legal_qa")
 
+# ========== Mongo config ==========
+MONGODB_URI = os.getenv("MONGODB_URI") or os.getenv("MONGO_URI")
+MONGODB_DB = os.getenv("MONGODB_DB", os.getenv("MONGO_DB", "tvpl"))
+MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", os.getenv("MONGO_COLLECTION", "processed_documents"))
 
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 def get_connection():

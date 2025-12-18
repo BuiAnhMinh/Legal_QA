@@ -14,6 +14,7 @@ services:
       - ./data:/app/data
       - ./app:/app/app
       - ./database:/app/database
+      - ./scripts:/app/scripts 
     ports:
       - "8080:8080"   # host:container
     networks:

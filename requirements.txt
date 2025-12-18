@@ -8,3 +8,4 @@ scikit-learn
 psycopg2-binary
 pgvector
 asyncpg>= 0.29
+pymongo

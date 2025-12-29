@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS articles (
     law_fk      INTEGER NOT NULL REFERENCES laws(id) ON DELETE CASCADE,
     law_id      TEXT NOT NULL,
     article_id  TEXT NOT NULL,
+    article_idx TEXT,
+    title       TEXT,
     text        TEXT NOT NULL,
     embedding   vector(1536),
     embedding_bge_m3 vector(1024),
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS article_chunks (
     id                  BIGSERIAL PRIMARY KEY,
     article_fk          INT NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
     doc_id              INT,
+    chunk_title         TEXT,
     chunk_index         INT NOT NULL,
     char_start          INT NOT NULL,
     char_end            INT NOT NULL,
@@ -44,6 +47,7 @@ CREATE TABLE IF NOT EXISTS article_chunks (
     token               TEXT[],
     token_no_stopword   TEXT[],
     embedding_bge_m3    vector(1024),
+    embedding_with_title_bge_m3 vector(1024),
     created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_article_chunk UNIQUE (article_fk, chunk_index)
 );
@@ -139,9 +143,14 @@ def main():
         # Ensure token columns exist even if table was created in an older version
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token TEXT[];")
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS token_no_stopword TEXT[];")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS article_idx TEXT;")
+        cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS title TEXT;")
         # Ensure embedding columns exist (legacy tables may be missing bge_m3)
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding vector(1536);")
         cur.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS embedding_bge_m3 vector(1024);")
+        cur.execute("ALTER TABLE article_chunks ADD COLUMN IF NOT EXISTS embedding_with_title_bge_m3 vector(1024);")
+        cur.execute("ALTER TABLE article_chunks ADD COLUMN IF NOT EXISTS embedding_bge_m3 vector(1024);")
+        cur.execute("ALTER TABLE article_chunks ADD COLUMN IF NOT EXISTS chunk_title TEXT;")
         conn.commit()
         print("Schema ensured (laws, articles, BM25 tables).")
 

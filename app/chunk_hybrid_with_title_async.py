@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, List, Sequence, Optional
 
 import asyncpg
 import numpy as np
@@ -105,11 +105,11 @@ async def ann_query(
     WITH top_chunks AS (
         SELECT
             ac.doc_id,
-            ac.embedding_bge_m3 {op} $1::vector AS score
+            ac.embedding_with_title_bge_m3 {op} $1::vector AS score
         FROM article_chunks ac
-        WHERE ac.embedding_bge_m3 IS NOT NULL
+        WHERE ac.embedding_with_title_bge_m3 IS NOT NULL
           AND ac.doc_id IS NOT NULL
-        ORDER BY ac.embedding_bge_m3 {op} $1::vector {order}
+        ORDER BY ac.embedding_with_title_bge_m3 {op} $1::vector {order}
         LIMIT $2
     ),
     doc_scores AS (
@@ -139,9 +139,6 @@ async def gold_scores(
     doc_ids: Sequence[int],
     metric: str = "cosine",
 ) -> Dict[int, float]:
-    """
-    For the provided doc_ids, return best (min distance) per doc.
-    """
     if not doc_ids:
         return {}
     if query_vec is None:
@@ -162,10 +159,10 @@ async def gold_scores(
     sql = f"""
     SELECT
         ac.doc_id,
-        MIN(ac.embedding_bge_m3 {op} $1::vector) AS score
+        MIN(ac.embedding_with_title_bge_m3 {op} $1::vector) AS score
     FROM article_chunks ac
     WHERE ac.doc_id = ANY($2::int[])
-      AND ac.embedding_bge_m3 IS NOT NULL
+      AND ac.embedding_with_title_bge_m3 IS NOT NULL
     GROUP BY ac.doc_id;
     """
 
@@ -215,6 +212,7 @@ async def evaluate(
     ef_search: int | None,
     metric: str,
     dump_path: Path | None,
+    baseline_path: Path | None,
 ) -> float:
     q_list = list(questions)
     if not q_list:
@@ -225,6 +223,18 @@ async def evaluate(
     lock = asyncio.Lock()
     dump_rows: List[Dict] = []
     dump_lock = asyncio.Lock()
+
+    baseline_lookup: Dict[str, Dict] = {}
+    if baseline_path is not None and baseline_path.exists():
+        with baseline_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                    qid = row.get("question_id")
+                    if qid:
+                        baseline_lookup[qid] = row
+                except Exception:
+                    continue
 
     async def next_item():
         async with lock:
@@ -258,24 +268,38 @@ async def evaluate(
             rs.append(r)
 
             if dump_path is not None:
-                dense_best = dense_pairs[0][1] if dense_pairs else None
-                dense_best_sim = None
-                if dense_best is not None and metric == "cosine":
-                    dense_best_sim = 1.0 - dense_best
-                gold_cosine = None
-                if metric == "cosine":
-                    gs = await gold_scores(pool, q["embedding"], q["gold_doc_ids"], metric=metric)
-                    gold_cosine = {doc: 1.0 - score for doc, score in gs.items()}
-                async with dump_lock:
-                    dump_rows.append(
-                        {
-                            "question_id": q.get("question_id"),
-                            "text": q.get("text"),
-                            "gold_all": sorted(list(q["gold_doc_ids"])),
-                            "dense_best_score": dense_best_sim,
-                            "gold_cosine": gold_cosine,
-                        }
-                    )
+                qid = q.get("question_id")
+                gold_all = sorted(list(q["gold_doc_ids"]))
+                baseline_row: Optional[Dict] = baseline_lookup.get(qid) if qid else None
+
+                baseline_dense = baseline_row.get("dense_best_score") if baseline_row else None
+                baseline_gold_cosine = baseline_row.get("gold_cosine") if baseline_row else None
+
+                title_missing = set(gold_all) - set(hybrid_docs)
+                missing_delta = sorted(list(title_missing))
+
+                if missing_delta:
+                    dense_best = dense_pairs[0][1] if dense_pairs else None
+                    dense_best_sim = None
+                    if dense_best is not None and metric == "cosine":
+                        dense_best_sim = 1.0 - dense_best
+                    gold_cosine_title = None
+                    if metric == "cosine":
+                        gs = await gold_scores(pool, q["embedding"], gold_all, metric=metric)
+                        gold_cosine_title = {doc: 1.0 - score for doc, score in gs.items()}
+                    async with dump_lock:
+                        dump_rows.append(
+                            {
+                                "question_id": qid,
+                                "text": q.get("text"),
+                                "gold_all": gold_all,
+                                "missing_due_to_title": missing_delta,
+                                "dense_best_title": dense_best_sim,
+                                "dense_best_baseline": baseline_dense,
+                                "gold_cosine_title": gold_cosine_title,
+                                "gold_cosine_baseline": baseline_gold_cosine,
+                            }
+                        )
 
         return f2s, ps, rs
 
@@ -296,7 +320,7 @@ async def evaluate(
         with dump_path.open("w", encoding="utf-8") as f:
             for item in dump_rows:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
-        print(f"Wrote {len(dump_rows)} question rows to {dump_path}")
+        print(f"Wrote {len(dump_rows)} questions with regressions to {dump_path}")
 
     print(
         f"Hybrid BM25+ANN @ {top_k}: alpha={alpha:.2f}, bm25_top={bm25_top}, dense_chunks={dense_chunks}, "
@@ -316,9 +340,10 @@ async def main_async(
     probes: int | None,
     ef_search: int | None,
     metric: str,
-    dump_path: Path | None,
     emb_path: Path,
     meta_path: Path,
+    dump_path: Path | None,
+    baseline_path: Path | None,
 ):
     questions = load_questions_with_embeddings(limit=limit, emb_path=emb_path, meta_path=meta_path)
     print(
@@ -351,6 +376,7 @@ async def main_async(
             ef_search=ef_search,
             metric=metric,
             dump_path=dump_path,
+            baseline_path=baseline_path,
         )
     finally:
         await pool.close()
@@ -421,7 +447,13 @@ def main():
         "--dump-misses",
         type=Path,
         default=None,
-        help="Write per-question results (gold/preds/precision/recall/f2) to this JSONL file.",
+        help="Write regression cases (gold missing vs baseline) to this JSONL file.",
+    )
+    parser.add_argument(
+        "--baseline-dump",
+        type=Path,
+        default=None,
+        help="Baseline JSONL (from chunk_hybrid_bm25_ann_async --dump-misses) to compare against.",
     )
     args = parser.parse_args()
 
@@ -439,9 +471,10 @@ def main():
             probes=args.probes,
             ef_search=args.ef_search,
             metric=args.metric,
-            dump_path=args.dump_misses,
             emb_path=emb_path,
             meta_path=meta_path,
+            dump_path=args.dump_misses,
+            baseline_path=args.baseline_dump,
         )
     )
 

@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from json.decoder import JSONDecodeError
 from typing import List, Tuple
+import re
 
 import numpy as np
 from psycopg2.extras import execute_values
@@ -21,6 +22,20 @@ from app.config import (
 )
 
 DEFAULT_MODEL_NAME = "baai/bge-m3"
+
+
+def combine_chunk_title(title: str | None, text: str) -> str:
+    """
+    Prefix chunk text with its title when available to give the encoder more context.
+    """
+    prefix = (title or "").strip()
+    if not prefix:
+        return text
+    return f"{prefix}\n\n{text}"
+
+
+def _clean(val: str | None) -> str:
+    return (val or "").strip()
 
 
 def preprocess_batch(texts: List[str]) -> List[str]:
@@ -82,23 +97,36 @@ def _embed_one_batch(model: str, rows: List[Tuple[int, str]]) -> List[Tuple[int,
     return list(zip(ids, literals))
 
 
-def _bulk_update_embeddings(cur, table: str, pairs: List[Tuple[int, str]]):
+def _bulk_update_embeddings(cur, table: str, column: str, pairs: List[Tuple[int, str]]):
     """
     Bulk update:
-      UPDATE <table> SET embedding_bge_m3 = v.emb::vector FROM (VALUES ...) v(id, emb) WHERE <table>.id = v.id
+      UPDATE <table> SET <column> = v.emb::vector FROM (VALUES ...) v(id, emb) WHERE <table>.id = v.id
     """
+    if table not in {"article_chunks", "articles"}:
+        raise ValueError(f"Unsupported table: {table}")
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", column):
+        raise ValueError(f"Invalid column name: {column}")
+
     sql = f"""
         UPDATE {table} AS t
-        SET embedding_bge_m3 = v.emb::vector
+        SET {column} = v.emb::vector
         FROM (VALUES %s) AS v(id, emb)
         WHERE t.id = v.id
     """
     execute_values(cur, sql, pairs, template="(%s, %s)", page_size=2000)
 
 
-def main(model_name: str | None = None, limit: int | None = None, target: str = "chunks") -> None:
+def main(
+    model_name: str | None = None,
+    limit: int | None = None,
+    target: str = "chunks",
+    use_chunk_title: bool = True,
+    target_column: str = "embedding_bge_m3",
+    law_title_fallback: bool = True,
+) -> None:
     model = model_name or DEFAULT_MODEL_NAME
     table = "article_chunks" if target == "chunks" else "articles"
+    include_titles = use_chunk_title and target == "chunks"
 
     print(f"[embed] Target table='{table}', model='{model}', batch_size={BATCH_SIZE}, concurrency={EMBED_CONCURRENCY}")
 
@@ -106,21 +134,73 @@ def main(model_name: str | None = None, limit: int | None = None, target: str = 
     cur = conn.cursor()
 
     try:
-        sql = f"""
-            SELECT id, text
-            FROM {table}
-            WHERE embedding_bge_m3 IS NULL
-            ORDER BY id
-        """
+        if include_titles:
+            sql = f"""
+                SELECT
+                    ac.id,
+                    ac.chunk_title,
+                    l.title AS law_title,
+                    ac.text
+                FROM article_chunks ac
+                JOIN articles a ON a.id = ac.article_fk
+                LEFT JOIN laws l ON l.id = a.law_fk
+                WHERE {target_column} IS NULL
+                ORDER BY ac.id
+            """
+        elif target == "articles" and law_title_fallback:
+            sql = f"""
+                SELECT
+                    a.id,
+                    a.title AS article_title,
+                    l.title AS law_title,
+                    a.article_id,
+                    a.text
+                FROM articles a
+                LEFT JOIN laws l ON l.id = a.law_fk
+                WHERE {target_column} IS NULL
+                ORDER BY a.id
+            """
+        else:
+            select_cols = "id, text"
+            sql = f"""
+                SELECT {select_cols}
+                FROM {table}
+                WHERE {target_column} IS NULL
+                ORDER BY id
+            """
         params: List = []
         if limit is not None:
             sql += " LIMIT %s"
             params.append(limit)
 
         cur.execute(sql, params)
-        rows: List[Tuple[int, str]] = cur.fetchall()
+        raw_rows = cur.fetchall()
+
+        if include_titles:
+            rows: List[Tuple[int, str]] = []
+            for rid, chunk_title, law_title, text in raw_rows:
+                ct = _clean(chunk_title)
+                lt = _clean(law_title) if law_title_fallback else ""
+                effective_title = ct or lt
+                rows.append((rid, combine_chunk_title(effective_title, text)))
+        elif target == "articles" and law_title_fallback:
+            rows = []
+            for rid, article_title, law_title, article_id, text in raw_rows:
+                at = _clean(article_title)
+                lt = _clean(law_title)
+                if at:
+                    effective_title = at
+                elif lt:
+                    suffix = f" — Article {article_id}" if article_id else ""
+                    effective_title = f"{lt}{suffix}"
+                else:
+                    effective_title = f"Article {article_id}" if article_id else "Untitled article"
+                rows.append((rid, combine_chunk_title(effective_title, text)))
+        else:
+            rows = [(rid, text) for rid, text in raw_rows]
+
         total = len(rows)
-        print(f"[embed] Rows without embedding_bge_m3: {total}")
+        print(f"[embed] Rows without {target_column}: {total}")
         if total == 0:
             return
 
@@ -138,7 +218,7 @@ def main(model_name: str | None = None, limit: int | None = None, target: str = 
                 batch_rows = futures[fut]
                 try:
                     pairs = fut.result()
-                    _bulk_update_embeddings(cur, table=table, pairs=pairs)
+                    _bulk_update_embeddings(cur, table=table, column=target_column, pairs=pairs)
                     completed += len(pairs)
                     commit_counter += 1
 
@@ -154,7 +234,7 @@ def main(model_name: str | None = None, limit: int | None = None, target: str = 
 
         conn.commit()
         print(f"[embed] DONE. updated rows={completed}, failed_batches={failed_batches}")
-        print(f"[embed] Stored embeddings in {table}.embedding_bge_m3")
+        print(f"[embed] Stored embeddings in {table}.{target_column}")
 
     except Exception as e:
         conn.rollback()
@@ -171,5 +251,28 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default=None, help="Embedding model name (default: baai/bge-m3).")
     parser.add_argument("--limit", type=int, default=None, help="Limit number of rows to embed.")
     parser.add_argument("--target", type=str, default="chunks", choices=["chunks", "articles"], help="Embed table: chunks (recommended) or articles (legacy).")
+    parser.add_argument(
+        "--no-chunk-title",
+        action="store_true",
+        help="For chunk target, skip prefixing chunk_title before embedding (defaults to including it).",
+    )
+    parser.add_argument(
+        "--column",
+        type=str,
+        default="embedding_bge_m3",
+        help="Target vector column to update (default: embedding_bge_m3).",
+    )
+    parser.add_argument(
+        "--no-law-title-fallback",
+        action="store_true",
+        help="Disable using law.title as a fallback when article/chunk titles are missing.",
+    )
     args = parser.parse_args()
-    main(model_name=args.model, limit=args.limit, target=args.target)
+    main(
+        model_name=args.model,
+        limit=args.limit,
+        target=args.target,
+        use_chunk_title=not args.no_chunk_title,
+        target_column=args.column,
+        law_title_fallback=not args.no_law_title_fallback,
+    )

@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS article_chunks (
     id                  BIGSERIAL PRIMARY KEY,
     article_fk          INT NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
     doc_id              INT,
+    chunk_title         TEXT,
     chunk_index         INT NOT NULL,          -- 1..N
     char_start          INT NOT NULL,
     char_end            INT NOT NULL,
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS article_chunks (
     token               TEXT[],
     token_no_stopword   TEXT[],
     embedding_bge_m3    vector(1024),
+    embedding_with_title_bge_m3 vector(1024),
     created_at          TIMESTAMP NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_article_chunk UNIQUE (article_fk, chunk_index)
 );
@@ -127,11 +129,16 @@ def chunk_text(text: str, max_chars: int, overlap: int, min_chars: int) -> List[
     return chunks
 
 
-def process_article(article_pk: int, doc_id: Optional[int], text: str) -> List[Tuple]:
+def process_article(
+    article_pk: int,
+    doc_id: Optional[int],
+    text: str,
+    article_title: Optional[str],
+) -> List[Tuple]:
     """
     Runs in ProcessPool (CPU parallel).
     Returns rows for COPY/INSERT:
-      (article_fk, doc_id, chunk_index, char_start, char_end, text, token, token_no_stopword)
+      (article_fk, doc_id, chunk_title, chunk_index, char_start, char_end, text, token, token_no_stopword)
     """
     pieces = chunk_text(
         text=text or "",
@@ -142,16 +149,42 @@ def process_article(article_pk: int, doc_id: Optional[int], text: str) -> List[T
     if not pieces:
         return []
 
+    total = len(pieces)
+
+    def _build_chunk_title(idx: int) -> Optional[str]:
+        base = (article_title or "").strip()
+        if not base:
+            return None
+        if total > 1:
+            return f"{base} (chunk {idx}/{total})"
+        return base
+
     out: List[Tuple] = []
     for idx, (s, e, ctext) in enumerate(pieces, start=1):
         toks, toks_ns = tokenize(ctext)
-        out.append((article_pk, doc_id, idx, s, e, ctext, toks, toks_ns))
+        out.append(
+            (
+                article_pk,
+                doc_id,
+                _build_chunk_title(idx),
+                idx,
+                s,
+                e,
+                ctext,
+                toks,
+                toks_ns,
+            )
+        )
     return out
 
 
 async def ensure_schema(pool: asyncpg.Pool, rebuild: bool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(CHUNK_TABLE_SQL)
+        await conn.execute("ALTER TABLE article_chunks ADD COLUMN IF NOT EXISTS chunk_title TEXT;")
+        await conn.execute("ALTER TABLE article_chunks ADD COLUMN IF NOT EXISTS embedding_with_title_bge_m3 vector(1024);")
+        await conn.execute("ALTER TABLE article_chunks ADD COLUMN IF NOT EXISTS embedding_bge_m3 vector(1024);")
+        await conn.execute("ALTER TABLE articles ADD COLUMN IF NOT EXISTS title TEXT;")
         if rebuild:
             print("[chunk-async] TRUNCATE article_chunks ...")
             await conn.execute("TRUNCATE TABLE article_chunks RESTART IDENTITY;")
@@ -168,6 +201,7 @@ async def insert_rows_copy(pool: asyncpg.Pool, rows: List[Tuple]) -> None:
             columns=[
                 "article_fk",
                 "doc_id",
+                "chunk_title",
                 "chunk_index",
                 "char_start",
                 "char_end",
@@ -184,10 +218,11 @@ async def insert_rows_upsert(pool: asyncpg.Pool, rows: List[Tuple]) -> None:
     """
     sql = """
     INSERT INTO article_chunks
-      (article_fk, doc_id, chunk_index, char_start, char_end, text, token, token_no_stopword)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+      (article_fk, doc_id, chunk_title, chunk_index, char_start, char_end, text, token, token_no_stopword)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
     ON CONFLICT (article_fk, chunk_index) DO UPDATE
     SET doc_id = EXCLUDED.doc_id,
+        chunk_title = EXCLUDED.chunk_title,
         char_start = EXCLUDED.char_start,
         char_end = EXCLUDED.char_end,
         text = EXCLUDED.text,
@@ -243,9 +278,12 @@ async def rebuild_chunks_async(
             article_pk = record["id"]
             doc_id = record["doc_id"]
             text = record["text"]
+            title = record["title"]
 
             async with sem:
-                rows = await loop.run_in_executor(proc_pool, process_article, article_pk, doc_id, text)
+                rows = await loop.run_in_executor(
+                    proc_pool, process_article, article_pk, doc_id, text, title
+                )
 
             processed_articles += 1
             if rows:
@@ -261,7 +299,7 @@ async def rebuild_chunks_async(
                     print(f"[chunk-async] processed_articles={processed_articles}, inserted_chunks={inserted_chunks}")
 
         async with pool.acquire() as conn:
-            sql = "SELECT id, doc_id, text FROM articles ORDER BY id"
+            sql = "SELECT id, doc_id, text, title FROM articles ORDER BY id"
             args = []
             if limit is not None:
                 sql += " LIMIT $1"

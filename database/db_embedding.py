@@ -123,6 +123,7 @@ def main(
     use_chunk_title: bool = True,
     target_column: str = "embedding_bge_m3",
     law_title_fallback: bool = True,
+    law_title_only: bool = False,
 ) -> None:
     model = model_name or DEFAULT_MODEL_NAME
     table = "article_chunks" if target == "chunks" else "articles"
@@ -181,14 +182,16 @@ def main(
             for rid, chunk_title, law_title, text in raw_rows:
                 ct = _clean(chunk_title)
                 lt = _clean(law_title) if law_title_fallback else ""
-                effective_title = ct or lt
+                effective_title = lt if law_title_only else (ct or lt)
                 rows.append((rid, combine_chunk_title(effective_title, text)))
         elif target == "articles" and law_title_fallback:
             rows = []
             for rid, article_title, law_title, article_id, text in raw_rows:
                 at = _clean(article_title)
                 lt = _clean(law_title)
-                if at:
+                if law_title_only:
+                    effective_title = lt
+                elif at:
                     effective_title = at
                 elif lt:
                     suffix = f" — Article {article_id}" if article_id else ""
@@ -267,6 +270,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable using law.title as a fallback when article/chunk titles are missing.",
     )
+    parser.add_argument(
+        "--law-title-only",
+        action="store_true",
+        help="Prefix only law.title, ignore article/chunk titles.",
+    )
     args = parser.parse_args()
     main(
         model_name=args.model,
@@ -275,4 +283,5 @@ if __name__ == "__main__":
         use_chunk_title=not args.no_chunk_title,
         target_column=args.column,
         law_title_fallback=not args.no_law_title_fallback,
+        law_title_only=args.law_title_only,
     )

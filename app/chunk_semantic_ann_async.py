@@ -25,6 +25,7 @@ async def evaluate(
     probes: int | None,
     ef_search: int | None,
     metric: str,
+    column: str,
 ) -> float:
     """
     Bounded evaluation with worker pool.
@@ -59,9 +60,11 @@ async def evaluate(
                 probes=probes,
                 ef_search=ef_search,
                 metric=metric,
+                column=column,
             )
-            f2s.append(fbeta_score(q["gold_doc_ids"], preds, beta=2.0))
-            p, r = precision_recall(q["gold_doc_ids"], preds)
+            pred_docs = [doc for doc, _ in preds]
+            f2s.append(fbeta_score(q["gold_doc_ids"], pred_docs, beta=2.0))
+            p, r = precision_recall(q["gold_doc_ids"], pred_docs)
             ps.append(p)
             rs.append(r)
 
@@ -97,6 +100,7 @@ async def main_async(
     metric: str,
     emb_path: Path,
     meta_path: Path,
+    column: str,
 ):
     questions = load_questions_with_embeddings(limit=limit, emb_path=emb_path, meta_path=meta_path)
     print(
@@ -125,6 +129,7 @@ async def main_async(
             probes=probes,
             ef_search=ef_search,
             metric=metric,
+            column=column,
         )
     finally:
         await pool.close()
@@ -179,6 +184,12 @@ def main():
         default=None,
         help="Path to question embedding meta JSON (default: data/train_embedding_meta.json).",
     )
+    parser.add_argument(
+        "--column",
+        type=str,
+        default="embedding_bge_m3",
+        help="Chunk embedding column to query (default: embedding_bge_m3).",
+    )
     args = parser.parse_args()
 
     emb_path = args.emb_path or Path("data/train_embedding_bge_m3.npy")
@@ -195,6 +206,7 @@ def main():
             metric=args.metric,
             emb_path=emb_path,
             meta_path=meta_path,
+            column=args.column,
         )
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Sequence, Tuple
+import re
 
 import asyncpg
 from pgvector.asyncpg import register_vector
@@ -74,6 +75,7 @@ async def ann_query(
     probes: int | None = None,
     ef_search: int | None = None,
     metric: str = "cosine",
+    column: str = "embedding_bge_m3",
 ) -> List[tuple[int, float]]:
     """
     ANN over chunk embeddings; returns per-doc best chunk score as (doc_id, score).
@@ -93,20 +95,24 @@ async def ann_query(
         "ip": "<#>",
     }.get(metric, "<=>")
     order = "ASC" if metric in ("cosine", "l2") else "DESC"
+    agg = "MIN" if order == "ASC" else "MAX"
+
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", column):
+        raise ValueError(f"Invalid column name: {column}")
 
     sql = f"""
     WITH top_chunks AS (
         SELECT
             ac.doc_id,
-            ac.embedding_bge_m3 {op} $1::vector AS score
+            ac.{column} {op} $1::vector AS score
         FROM article_chunks ac
-        WHERE ac.embedding_bge_m3 IS NOT NULL
+        WHERE ac.{column} IS NOT NULL
           AND ac.doc_id IS NOT NULL
-        ORDER BY ac.embedding_bge_m3 {op} $1::vector {order}
+        ORDER BY ac.{column} {op} $1::vector {order}
         LIMIT $2
     ),
     doc_scores AS (
-        SELECT doc_id, MIN(score) AS best_score
+        SELECT doc_id, {agg}(score) AS best_score
         FROM top_chunks
         GROUP BY doc_id
     )

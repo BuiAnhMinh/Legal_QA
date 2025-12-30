@@ -100,6 +100,7 @@ async def ann_query(
         "ip": "<#>",
     }.get(metric, "<=>")
     order = "ASC" if metric in ("cosine", "l2") else "DESC"
+    agg = "MIN" if order == "ASC" else "MAX"
 
     sql = f"""
     WITH top_chunks AS (
@@ -113,7 +114,7 @@ async def ann_query(
         LIMIT $2
     ),
     doc_scores AS (
-        SELECT doc_id, MIN(score) AS best_score
+        SELECT doc_id, {agg}(score) AS best_score
         FROM top_chunks
         GROUP BY doc_id
     )
@@ -158,11 +159,12 @@ async def gold_scores(
         "l2": "<->",
         "ip": "<#>",
     }.get(metric, "<=>")
+    agg = "MIN" if metric in ("cosine", "l2") else "MAX"
 
     sql = f"""
     SELECT
         ac.doc_id,
-        MIN(ac.embedding_bge_m3 {op} $1::vector) AS score
+        {agg}(ac.embedding_bge_m3 {op} $1::vector) AS score
     FROM article_chunks ac
     WHERE ac.doc_id = ANY($2::int[])
       AND ac.embedding_bge_m3 IS NOT NULL
@@ -250,7 +252,8 @@ async def evaluate(
                 ef_search=ef_search,
                 metric=metric,
             )
-            hybrid_docs = hybrid_merge(bm25_pairs, dense_pairs, alpha=alpha)[:top_k]
+            dense_pairs_sim = [(doc, -score) if metric in ("cosine", "l2") else (doc, score) for doc, score in dense_pairs]
+            hybrid_docs = hybrid_merge(bm25_pairs, dense_pairs_sim, alpha=alpha)[:top_k]
 
             f2s.append(fbeta_score(q["gold_doc_ids"], hybrid_docs, beta=2.0))
             p, r = precision_recall(q["gold_doc_ids"], hybrid_docs)

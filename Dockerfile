@@ -7,13 +7,22 @@ WORKDIR /app
 # 3) Install system dependencies (if you need them)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    cargo \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# 3.5) Install uv (fast Python installer) and maturin (needed by underthesea)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin:/root/.local/bin:${PATH}"
+ENV UV_NO_BUILD_ISOLATION=1 \
+    PIP_NO_BUILD_ISOLATION=1
+RUN uv pip install --system --no-cache-dir --no-build-isolation --upgrade pip maturin==1.7.0
 
 # 4) Copy dependency files first (for better caching)
 COPY requirements.txt .
 
 # 5) Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install --system --no-cache-dir --no-build-isolation -r requirements.txt
 
 # 6) Copy the rest of your code
 COPY app ./app

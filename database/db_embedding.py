@@ -5,12 +5,19 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from json.decoder import JSONDecodeError
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import re
+import sys
+from pathlib import Path
 
 import numpy as np
 from psycopg2.extras import execute_values
 from tqdm import tqdm
+
+# Ensure project root is on sys.path when run as a script.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 from app.config import (
     BATCH_SIZE,
@@ -83,10 +90,10 @@ def _embed_call_with_retry(model: str, texts: List[str], max_attempts: int = 6):
     raise last_err  # type: ignore[misc]
 
 
-def _embed_one_batch(model: str, rows: List[Tuple[int, str]]) -> List[Tuple[int, str]]:
+def _embed_one_batch(model: str, rows: List[Tuple[int, str]]) -> Tuple[List[Tuple[int, str]], dict]:
     """
     rows: [(row_id, text), ...] where row_id is chunk id (or article id if target=articles)
-    returns: [(row_id, pgvector_literal), ...]
+    returns: ([(row_id, pgvector_literal), ...], usage_dict)
     """
     ids = [r[0] for r in rows]
     texts = preprocess_batch([r[1] for r in rows])
@@ -94,7 +101,24 @@ def _embed_one_batch(model: str, rows: List[Tuple[int, str]]) -> List[Tuple[int,
     resp = _embed_call_with_retry(model=model, texts=texts)
     embs = [np.array(d.embedding, dtype="float32") for d in resp.data]
     literals = [_emb_to_pgvector_literal(e) for e in embs]
-    return list(zip(ids, literals))
+    usage = {}
+    usage_obj = getattr(resp, "usage", None)
+    if usage_obj:
+        # OpenAI/OpenRouter style usage fields
+        prompt_tokens = getattr(usage_obj, "prompt_tokens", None)
+        total_tokens = getattr(usage_obj, "total_tokens", None)
+        if hasattr(usage_obj, "to_dict"):
+            data = usage_obj.to_dict()
+            prompt_tokens = prompt_tokens or data.get("prompt_tokens")
+            total_tokens = total_tokens or data.get("total_tokens")
+        if isinstance(usage_obj, dict):
+            prompt_tokens = prompt_tokens or usage_obj.get("prompt_tokens")
+            total_tokens = total_tokens or usage_obj.get("total_tokens")
+        usage = {
+            "prompt_tokens": int(prompt_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+        }
+    return list(zip(ids, literals)), usage
 
 
 def _bulk_update_embeddings(cur, table: str, column: str, pairs: List[Tuple[int, str]]):
@@ -124,6 +148,7 @@ def main(
     target_column: str = "embedding_bge_m3",
     law_title_fallback: bool = True,
     law_title_only: bool = False,
+    price_per_1k: Optional[float] = None,
 ) -> None:
     model = model_name or DEFAULT_MODEL_NAME
     table = "article_chunks" if target == "chunks" else "articles"
@@ -135,7 +160,9 @@ def main(
     cur = conn.cursor()
 
     try:
-        if include_titles:
+        params: List = []
+
+        if table == "article_chunks":
             sql = f"""
                 SELECT
                     ac.id,
@@ -148,7 +175,7 @@ def main(
                 WHERE {target_column} IS NULL
                 ORDER BY ac.id
             """
-        elif target == "articles" and law_title_fallback:
+        elif target == "articles":
             sql = f"""
                 SELECT
                     a.id,
@@ -162,14 +189,12 @@ def main(
                 ORDER BY a.id
             """
         else:
-            select_cols = "id, text"
             sql = f"""
-                SELECT {select_cols}
+                SELECT id, text
                 FROM {table}
                 WHERE {target_column} IS NULL
                 ORDER BY id
             """
-        params: List = []
         if limit is not None:
             sql += " LIMIT %s"
             params.append(limit)
@@ -177,13 +202,16 @@ def main(
         cur.execute(sql, params)
         raw_rows = cur.fetchall()
 
-        if include_titles:
+        if table == "article_chunks":
             rows: List[Tuple[int, str]] = []
             for rid, chunk_title, law_title, text in raw_rows:
-                ct = _clean(chunk_title)
-                lt = _clean(law_title) if law_title_fallback else ""
-                effective_title = lt if law_title_only else (ct or lt)
-                rows.append((rid, combine_chunk_title(effective_title, text)))
+                if include_titles:
+                    ct = _clean(chunk_title)
+                    lt = _clean(law_title) if law_title_fallback else ""
+                    effective_title = lt if law_title_only else (ct or lt)
+                    rows.append((rid, combine_chunk_title(effective_title, text)))
+                else:
+                    rows.append((rid, text))
         elif target == "articles" and law_title_fallback:
             rows = []
             for rid, article_title, law_title, article_id, text in raw_rows:
@@ -213,6 +241,8 @@ def main(
         completed = 0
         failed_batches = 0
         commit_counter = 0
+        total_prompt_tokens = 0
+        total_total_tokens = 0
 
         with ThreadPoolExecutor(max_workers=EMBED_CONCURRENCY) as ex:
             futures = {ex.submit(_embed_one_batch, model, b): b for b in batches}
@@ -220,9 +250,11 @@ def main(
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Embedding (concurrent)"):
                 batch_rows = futures[fut]
                 try:
-                    pairs = fut.result()
+                    pairs, usage = fut.result()
                     _bulk_update_embeddings(cur, table=table, column=target_column, pairs=pairs)
                     completed += len(pairs)
+                    total_prompt_tokens += usage.get("prompt_tokens", 0)
+                    total_total_tokens += usage.get("total_tokens", 0)
                     commit_counter += 1
 
                     if commit_counter >= max(1, SAVE_EVERY):
@@ -238,6 +270,11 @@ def main(
         conn.commit()
         print(f"[embed] DONE. updated rows={completed}, failed_batches={failed_batches}")
         print(f"[embed] Stored embeddings in {table}.{target_column}")
+        if total_total_tokens:
+            print(f"[embed] Usage approx: prompt_tokens={total_prompt_tokens}, total_tokens={total_total_tokens}")
+            if price_per_1k is not None:
+                est_cost = (total_total_tokens / 1000.0) * price_per_1k
+                print(f"[embed] Estimated cost @ {price_per_1k}/1K tokens: ~{est_cost:.4f}")
 
     except Exception as e:
         conn.rollback()
@@ -275,6 +312,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Prefix only law.title, ignore article/chunk titles.",
     )
+    parser.add_argument(
+        "--price-per-1k",
+        type=float,
+        default=None,
+        help="Optional price per 1K tokens to estimate embedding cost from API usage.",
+    )
     args = parser.parse_args()
     main(
         model_name=args.model,
@@ -284,4 +327,5 @@ if __name__ == "__main__":
         target_column=args.column,
         law_title_fallback=not args.no_law_title_fallback,
         law_title_only=args.law_title_only,
+        price_per_1k=args.price_per_1k,
     )

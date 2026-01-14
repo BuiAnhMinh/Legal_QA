@@ -11,7 +11,7 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
 
-EMB_MODEL = os.getenv("EMB_MODEL", "openai/text-embedding-3-small")
+EMB_MODEL = os.getenv("EMB_MODEL", "baai/bge-m3")
 LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025")
 
 # ========== Paths ==========
@@ -24,11 +24,11 @@ STOPWORDS_PATH = Path(os.getenv("STOPWORDS_PATH", DATA_DIR / "vietnamese-stopwor
 
 # ========== Embedding settings ==========
 MAX_CHARS = int(os.getenv("MAX_CHARS", "4000"))          # max chars per chunk sent to embeddings API
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "16"))          # texts per API request
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))          # texts per API request
 SAVE_EVERY = int(os.getenv("SAVE_EVERY", "50"))          # commit every N batches/ops (used by various scripts)
 
 # Concurrency for embedding script (multiple API calls at once)
-EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", "16"))
+EMBED_CONCURRENCY = int(os.getenv("EMBED_CONCURRENCY", "32"))
 
 # Chunking settings
 CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", str(MAX_CHARS)))

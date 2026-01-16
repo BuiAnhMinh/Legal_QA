@@ -430,10 +430,14 @@ def main() -> None:
         print(f"Loaded {len(existing_norms)} existing law_ids from Postgres.")
 
         if args.auto_new_laws:
-            docs_cursor = mongo_client[MONGODB_DB][MONGODB_COLLECTION].find(
-                {"diagram.so_hieu": {"$exists": True}}
+            docs_cursor = (
+                mongo_client[MONGODB_DB][MONGODB_COLLECTION]
+                .find({"diagram.so_hieu": {"$exists": True}}, no_cursor_timeout=True)
+                .batch_size(250)
             )
-            print(f"Streaming Mongo docs until {args.auto_new_laws} new laws with articles are ingested...")
+            print(
+                f"Streaming Mongo docs until {args.auto_new_laws} new laws with articles are ingested..."
+            )
         else:
             mongo_ids = parse_object_ids(args.mongo_ids) if args.mongo_ids else None
             docs = fetch_documents(mongo_client, mongo_ids, args.law_ids, args.limit)
@@ -483,7 +487,9 @@ def main() -> None:
                 continue
 
             norm = _norm_law_id(law_id)
-            if norm in existing_norms or norm in seen_norms_run:
+            # Allow re-ingesting laws even if they already exist in Postgres (e.g., different source).
+            # Only skip duplicates within the same run to avoid double-processing the same doc.
+            if norm in seen_norms_run:
                 skipped_existing += 1
                 continue
 
@@ -543,6 +549,8 @@ def main() -> None:
 
     finally:
         try:
+            if docs_cursor is not None:
+                docs_cursor.close()
             if cur:
                 cur.close()
             if conn:

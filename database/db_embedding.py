@@ -69,13 +69,21 @@ def _embed_call_with_retry(model: str, texts: List[str], max_attempts: int = 6):
     """
     Retry on JSONDecodeError / network hiccups / transient 5xx/429-like issues.
     We intentionally create a fresh client per call (thread-safe).
+    Returns: (response_object, cost_header_or_None)
     """
     delay = 1.0
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
             client = get_client()
-            return client.embeddings.create(model=model, input=texts)
+            raw = client.embeddings.with_raw_response.create(model=model, input=texts)
+            # OpenRouter reports billed cost in a response header; fall back to None if missing.
+            cost_hdr = (
+                raw.headers.get("x-openrouter-cost")
+                or raw.headers.get("x-request-cost")
+                or raw.headers.get("x-embeddings-cost")
+            )
+            return raw.parse(), cost_hdr
         except JSONDecodeError as e:
             last_err = e
         except Exception as e:
@@ -98,10 +106,20 @@ def _embed_one_batch(model: str, rows: List[Tuple[int, str]]) -> Tuple[List[Tupl
     ids = [r[0] for r in rows]
     texts = preprocess_batch([r[1] for r in rows])
 
-    resp = _embed_call_with_retry(model=model, texts=texts)
+    resp, cost_hdr = _embed_call_with_retry(model=model, texts=texts)
     embs = [np.array(d.embedding, dtype="float32") for d in resp.data]
     literals = [_emb_to_pgvector_literal(e) for e in embs]
     usage = {}
+    # Capture provider-reported cost if available
+    cost_val = cost_hdr or getattr(resp, "cost", None)
+    if cost_val is None and hasattr(resp, "to_dict"):
+        try:
+            cost_val = resp.to_dict().get("cost")
+        except Exception:
+            cost_val = None
+    if cost_val is None and isinstance(resp, dict):
+        cost_val = resp.get("cost")
+
     usage_obj = getattr(resp, "usage", None)
     if usage_obj:
         # OpenAI/OpenRouter style usage fields
@@ -118,6 +136,11 @@ def _embed_one_batch(model: str, rows: List[Tuple[int, str]]) -> Tuple[List[Tupl
             "prompt_tokens": int(prompt_tokens or 0),
             "total_tokens": int(total_tokens or 0),
         }
+    try:
+        if cost_val is not None:
+            usage["cost"] = float(cost_val)
+    except (TypeError, ValueError):
+        pass
     return list(zip(ids, literals)), usage
 
 
@@ -243,6 +266,7 @@ def main(
         commit_counter = 0
         total_prompt_tokens = 0
         total_total_tokens = 0
+        total_cost = 0.0
 
         with ThreadPoolExecutor(max_workers=EMBED_CONCURRENCY) as ex:
             futures = {ex.submit(_embed_one_batch, model, b): b for b in batches}
@@ -255,6 +279,7 @@ def main(
                     completed += len(pairs)
                     total_prompt_tokens += usage.get("prompt_tokens", 0)
                     total_total_tokens += usage.get("total_tokens", 0)
+                    total_cost += float(usage.get("cost", 0.0))
                     commit_counter += 1
 
                     if commit_counter >= max(1, SAVE_EVERY):
@@ -275,6 +300,8 @@ def main(
             if price_per_1k is not None:
                 est_cost = (total_total_tokens / 1000.0) * price_per_1k
                 print(f"[embed] Estimated cost @ {price_per_1k}/1K tokens: ~{est_cost:.4f}")
+        if total_cost:
+            print(f"[embed] Reported API cost: ${total_cost:.4f}")
 
     except Exception as e:
         conn.rollback()

@@ -14,11 +14,11 @@ services:
       - ./app:/app/app
       - ./database:/app/database
       - ./scripts:/app/scripts 
+      - ./debug:/app/debug
     ports:
       - "8080:8080"   # host:container
     networks:
       - legal_net
-
   db:
     image: pgvector/pgvector:pg16
     container_name: legal_qa_db
@@ -33,7 +33,7 @@ services:
       - "5400:5432"
     networks:
       - legal_net
-
+    shm_size: 1g
   # Optional: pgAdmin UI to inspect DB
   pgadmin:
     image: dpage/pgadmin4

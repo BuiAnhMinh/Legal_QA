@@ -18,7 +18,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "google/gemini-2.5-flash-lite-preview-09-2025
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 
 LAW_PATH = Path(os.getenv("LAW_PATH", DATA_DIR / "legal_corpus.json"))
-TRAIN_PATH = Path(os.getenv("TRAIN_PATH", DATA_DIR / "train.json"))
+TRAIN_PATH = Path(os.getenv("TRAIN_PATH", DATA_DIR / "new_qna_from_mongo.json"))
 
 STOPWORDS_PATH = Path(os.getenv("STOPWORDS_PATH", DATA_DIR / "vietnamese-stopwords.txt"))
 

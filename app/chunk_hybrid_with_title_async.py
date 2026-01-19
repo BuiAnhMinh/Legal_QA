@@ -18,6 +18,8 @@ from app.semantic_eval_utils import (
     tokenize_question,
 )
 
+SOURCE_FILTER = "tvpl"
+
 
 async def _init_pgvector(conn: asyncpg.Connection) -> None:
     await register_vector(conn)
@@ -27,6 +29,7 @@ async def bm25_query(
     pool: asyncpg.pool.Pool,
     query_terms: Sequence[str],
     top_k: int,
+    source: str | None = None,
 ) -> List[tuple[int, float]]:
     """
     BM25 over precomputed stats (article_term_freq, term_stats, article_stats, collection_stats).
@@ -59,7 +62,9 @@ async def bm25_query(
         JOIN collection_stats cs
           ON cs.id = 1
         JOIN params p ON TRUE
+        JOIN articles a ON a.doc_id = atf.article_id
         WHERE atf.token = ANY (p.tokens)
+          AND ($3::text IS NULL OR a.source = $3)
         GROUP BY atf.article_id
     )
     SELECT doc_id, score
@@ -69,7 +74,7 @@ async def bm25_query(
     """
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, tokens, top_k)
+        rows = await conn.fetch(sql, tokens, top_k, source)
     return [(int(r["doc_id"]), float(r["score"])) for r in rows]
 
 
@@ -81,6 +86,7 @@ async def ann_query(
     probes: int | None = None,
     ef_search: int | None = None,
     metric: str = "cosine",
+    source: str | None = None,
 ) -> List[tuple[int, float]]:
     """
     ANN over chunk embeddings; returns per-doc best chunk score as (doc_id, score).
@@ -108,8 +114,10 @@ async def ann_query(
             ac.doc_id,
             ac.embedding_with_title_bge_m3 {op} $1::vector AS score
         FROM article_chunks ac
+        JOIN articles a ON a.id = ac.article_fk
         WHERE ac.embedding_with_title_bge_m3 IS NOT NULL
           AND ac.doc_id IS NOT NULL
+          AND ($4::text IS NULL OR a.source = $4)
         ORDER BY ac.embedding_with_title_bge_m3 {op} $1::vector {order}
         LIMIT $2
     ),
@@ -129,7 +137,7 @@ async def ann_query(
             await conn.execute(f"SET ivfflat.probes = {int(probes)};")
         if ef_search is not None:
             await conn.execute(f"SET hnsw.ef_search = {int(ef_search)};")
-        rows = await conn.fetch(sql, q_list, chunk_limit, top_k)
+        rows = await conn.fetch(sql, q_list, chunk_limit, top_k, source)
 
     return [(int(r["doc_id"]), float(r["score"])) for r in rows]
 
@@ -139,6 +147,7 @@ async def gold_scores(
     query_vec: Sequence[float],
     doc_ids: Sequence[int],
     metric: str = "cosine",
+    source: str | None = None,
 ) -> Dict[int, float]:
     if not doc_ids:
         return {}
@@ -165,11 +174,15 @@ async def gold_scores(
     FROM article_chunks ac
     WHERE ac.doc_id = ANY($2::int[])
       AND ac.embedding_with_title_bge_m3 IS NOT NULL
+      AND ($3::text IS NULL OR EXISTS (
+            SELECT 1 FROM articles a
+            WHERE a.id = ac.article_fk AND a.source = $3
+          ))
     GROUP BY ac.doc_id;
     """
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, q_list, list(doc_ids))
+        rows = await conn.fetch(sql, q_list, list(doc_ids), source)
     return {int(r["doc_id"]): float(r["score"]) for r in rows}
 
 
@@ -252,7 +265,12 @@ async def evaluate(
             if q is None:
                 break
 
-            bm25_pairs = await bm25_query(pool=pool, query_terms=tokenize_question(q["text"]), top_k=bm25_top)
+            bm25_pairs = await bm25_query(
+                pool=pool,
+                query_terms=tokenize_question(q["text"]),
+                top_k=bm25_top,
+                source=SOURCE_FILTER,
+            )
             dense_pairs = await ann_query(
                 pool=pool,
                 query_vec=q["embedding"],
@@ -261,6 +279,7 @@ async def evaluate(
                 probes=probes,
                 ef_search=ef_search,
                 metric=metric,
+                source=SOURCE_FILTER,
             )
             dense_pairs_sim = [(doc, -score) if metric in ("cosine", "l2") else (doc, score) for doc, score in dense_pairs]
             hybrid_docs = hybrid_merge(bm25_pairs, dense_pairs_sim, alpha=alpha)[:top_k]
@@ -288,7 +307,7 @@ async def evaluate(
                         dense_best_sim = 1.0 - dense_best
                     gold_cosine_title = None
                     if metric == "cosine":
-                        gs = await gold_scores(pool, q["embedding"], gold_all, metric=metric)
+                        gs = await gold_scores(pool, q["embedding"], gold_all, metric=metric, source=SOURCE_FILTER)
                         gold_cosine_title = {doc: 1.0 - score for doc, score in gs.items()}
                     async with dump_lock:
                         dump_rows.append(
@@ -438,13 +457,13 @@ def main():
         "--emb-path",
         type=Path,
         default=None,
-        help="Path to question embedding .npy (default: data/train_embedding_bge_m3.npy).",
+        help="Path to question embedding .npy (default: data/train_qna_mongo_bge_m3.npy).",
     )
     parser.add_argument(
         "--meta-path",
         type=Path,
         default=None,
-        help="Path to question embedding meta JSON (default: data/train_embedding_meta.json).",
+        help="Path to question embedding meta JSON (default: data/train_qna_mongo_meta.json).",
     )
     parser.add_argument(
         "--dump-misses",
@@ -460,8 +479,8 @@ def main():
     )
     args = parser.parse_args()
 
-    emb_path = args.emb_path or Path("data/train_embedding_bge_m3.npy")
-    meta_path = args.meta_path or Path("data/train_embedding_meta.json")
+    emb_path = args.emb_path or Path("data/train_qna_mongo_bge_m3.npy")
+    meta_path = args.meta_path or Path("data/train_qna_mongo_meta.json")
 
     asyncio.run(
         main_async(

@@ -412,13 +412,13 @@ def main():
         "--emb-path",
         type=Path,
         default=None,
-        help="Path to question embedding .npy (default: data/train_embedding_bge_m3.npy).",
+        help="Path to question embedding .npy (default: data/train_qna_mongo_bge_m3.npy).",
     )
     parser.add_argument(
         "--meta-path",
         type=Path,
         default=None,
-        help="Path to question embedding meta JSON (default: data/train_embedding_meta.json).",
+        help="Path to question embedding meta JSON (default: data/train_qna_mongo_meta.json).",
     )
     parser.add_argument(
         "--dump-misses",
@@ -428,8 +428,8 @@ def main():
     )
     args = parser.parse_args()
 
-    emb_path = args.emb_path or Path("data/train_embedding_bge_m3.npy")
-    meta_path = args.meta_path or Path("data/train_embedding_meta.json")
+    emb_path = args.emb_path or Path("data/train_qna_mongo_bge_m3.npy")
+    meta_path = args.meta_path or Path("data/train_qna_mongo_meta.json")
 
     asyncio.run(
         main_async(

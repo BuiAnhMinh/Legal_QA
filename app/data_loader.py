@@ -108,7 +108,8 @@ def load_train_data(
 
         out.append(
             {
-                "question_id": f"vlsp_{qid}",
+                # "question_id": f"vlsp_{qid}",
+                "question_id": f"tvpl_{qid}",
                 "text": text,
                 "gold_doc_ids": set(int(x) for x in rel),
             }

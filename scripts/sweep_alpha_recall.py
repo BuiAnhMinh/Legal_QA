@@ -375,8 +375,8 @@ def main():
     )
     args = parser.parse_args()
 
-    emb_path = args.emb_path or Path("data/train_embedding_bge_m3.npy")
-    meta_path = args.meta_path or Path("data/train_embedding_meta.json")
+    emb_path = args.emb_path or Path("data/train_qna_mongo_bge_m3.npy")
+    meta_path = args.meta_path or Path("data/train_qna_mongo_meta.json")
     args.emb_path = emb_path
     args.meta_path = meta_path
 

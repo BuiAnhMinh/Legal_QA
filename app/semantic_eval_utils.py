@@ -10,9 +10,11 @@ from underthesea import word_tokenize
 from app.data_loader import load_train_data
 
 # Default cache paths (produced by scripts/cache_train_embeddings.py)
-DEFAULT_EMB_PATH = Path("data/train_embedding_bge_m3.npy")
-DEFAULT_META_PATH = Path("data/train_embedding_meta.json")
+# DEFAULT_EMB_PATH = Path("data/train_embedding_bge_m3.npy")
+# DEFAULT_META_PATH = Path("data/train_embedding_meta.json")
 
+DEFAULT_EMB_PATH = Path("data/train_qna_mongo_bge_m3.npy")
+DEFAULT_META_PATH = Path("data/train_qna_mongo_meta.json")
 
 def tokenize_question(text: str) -> List[str]:
     tok_str = word_tokenize(text or "", format="text")

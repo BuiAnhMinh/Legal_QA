@@ -18,6 +18,8 @@ from app.retrieval_shared import ann_query, bm25_query, hybrid_merge, init_pgvec
 from app.semantic_eval_utils import fbeta_score, precision_recall, tokenize_question
 from database.db_embedding import DEFAULT_MODEL_NAME as DEFAULT_CHUNK_MODEL
 
+SOURCE_FILTER = "tvpl"
+
 
 def _generate_hyqe(question: str, count: int, max_chars: int) -> List[str]:
     """
@@ -284,6 +286,7 @@ async def evaluate(
                 pool=pool,
                 query_terms=tokenize_question(q["text"]),
                 top_k=bm25_top,
+                source=SOURCE_FILTER,
             )
             dense_score_map: Dict[int, float] = {}
             for _, vec, weight in hyqe_candidates:
@@ -298,6 +301,7 @@ async def evaluate(
                     ef_search=ef_search,
                     metric=metric,
                     column=column,
+                    source=SOURCE_FILTER,
                 )
                 for doc, score in dense_pairs:
                     sim = _to_similarity(score, metric)
@@ -469,7 +473,7 @@ def main():
     parser.add_argument(
         "--column",
         type=str,
-        default="embedding_bge_m3",
+        default="embedding_with_title_bge_m3",
         help="Chunk embedding column to query.",
     )
     parser.add_argument(

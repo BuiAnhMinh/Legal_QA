@@ -20,6 +20,7 @@ async def bm25_query(
     top_k: int,
     k1: float = 1.2,
     b: float = 0.75,
+    source: str | None = None,
 ) -> List[tuple[int, float]]:
     """
     BM25 over precomputed stats (article_term_freq, term_stats, article_stats, collection_stats).
@@ -52,7 +53,9 @@ async def bm25_query(
         JOIN collection_stats cs
           ON cs.id = 1
         JOIN params p ON TRUE
+        JOIN articles a ON a.doc_id = atf.article_id
         WHERE atf.token = ANY (p.tokens)
+          AND ($5::text IS NULL OR a.source = $5)
         GROUP BY atf.article_id
     )
     SELECT doc_id, score
@@ -62,7 +65,7 @@ async def bm25_query(
     """
 
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, tokens, k1, b, top_k)
+        rows = await conn.fetch(sql, tokens, k1, b, top_k, source)
     return [(int(r["doc_id"]), float(r["score"])) for r in rows]
 
 
@@ -76,6 +79,7 @@ async def ann_query(
     ef_search: int | None = None,
     metric: str = "cosine",
     column: str = "embedding_bge_m3",
+    source: str | None = None,
 ) -> List[tuple[int, float]]:
     """
     ANN over chunk embeddings; returns per-doc best chunk score as (doc_id, score).
@@ -106,8 +110,10 @@ async def ann_query(
             ac.doc_id,
             ac.{column} {op} $1::vector AS score
         FROM article_chunks ac
+        JOIN articles a ON a.id = ac.article_fk
         WHERE ac.{column} IS NOT NULL
           AND ac.doc_id IS NOT NULL
+          AND ($4::text IS NULL OR a.source = $4)
         ORDER BY ac.{column} {op} $1::vector {order}
         LIMIT $2
     ),
@@ -127,7 +133,7 @@ async def ann_query(
             await conn.execute(f"SET ivfflat.probes = {int(probes)};")
         if ef_search is not None:
             await conn.execute(f"SET hnsw.ef_search = {int(ef_search)};")
-        rows = await conn.fetch(sql, q_list, chunk_limit, top_k)
+        rows = await conn.fetch(sql, q_list, chunk_limit, top_k, source)
 
     return [(int(r["doc_id"]), float(r["score"])) for r in rows]
 
